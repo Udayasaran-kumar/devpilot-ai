@@ -8,9 +8,11 @@ proving it red-to-green in an isolated git worktree.
 
 Built for the Build, Ship, Shape: Amazon Developer Hackathon.
 
-> Status: foundation only. Domain schemas, the event-sourced engine skeleton,
-> tool and planner contracts, and a minimal CLI exist. Real tools, the Bedrock
-> planner, MCP server, HTTP API, and web UI are not implemented yet.
+> Status: early. Domain schemas, the event-sourced engine skeleton, planner
+> contracts, a minimal CLI, and sandboxed read-only repository tools
+> (`read_file`, `search_code`, `list_files`) exist. Command execution, git
+> worktrees, the Bedrock planner, MCP server, HTTP API, and web UI are not
+> implemented yet.
 
 ## Principles
 
@@ -39,13 +41,34 @@ apps/
 packages/
   core/       Zod schemas: Signal, Evidence, Hypothesis, InvestigationAction,
               VerificationResult, Report, InvestigationEvent
-  tools/      Tool contract (name, description, input/output schemas, run) and registry
+  tools/      Tool contract and registry, RepositorySandbox, and the read-only
+              read_file, search_code, and list_files tools
   planners/   Planner contract, PlannerDecision schema, RulePlanner placeholder
   engine/     InvestigationState, reducer, InvestigationSession, InvestigationEngine
   eval/       Fixture, GroundTruth, EvaluationResult, Evaluator contracts
-fixtures/     Evaluation fixtures (none yet)
+fixtures/     Sample repositories used by tests and evaluation
 tests/        Cross-package integration tests
 ```
+
+### Repository tools
+
+All filesystem access goes through a `RepositorySandbox` bound to one
+repository root. Each requested path is checked lexically, then resolved with
+`realpath` and checked again against the canonical root using path-relative
+comparison (not string prefixes), so `../` traversal, outside absolute paths,
+and symlinks that escape the root are rejected. Directory walks never follow
+symlinks and skip `.git` and `node_modules`; binary, non-UTF-8, and oversized
+files are never returned.
+
+| Tool          | Observes                                         | Evidence                       |
+| ------------- | ------------------------------------------------ | ------------------------------ |
+| `read_file`   | A UTF-8 file or inclusive 1-based line range     | One `source_code` item         |
+| `search_code` | Case-sensitive literal matches, one per line     | One `search_result` per match  |
+| `list_files`  | Sorted recursive listing of files and dirs       | None (structural only)         |
+
+Evidence IDs come from `createEvidenceId` over the tool name, the exact file
+location, and the observed content, so the same observation always has the
+same ID. `createDefaultToolRegistry(sandbox)` registers all three tools.
 
 Package dependencies flow one way:
 

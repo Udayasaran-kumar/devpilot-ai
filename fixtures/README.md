@@ -1,9 +1,22 @@
 # Fixtures
 
-Evaluation fixtures: small, real repositories with a reproducible failure, used
-to measure DevPilot AI end-to-end.
+Small, real repositories used to exercise and evaluate DevPilot AI.
 
-Each fixture will live in its own directory and contain:
+## `sample-repository/`
+
+A tiny TypeScript checkout and payment service (cart, discounts, money
+helpers, a payment gateway interface, and a fake gateway). It exists to test
+the read-only repository tools: reading files, searching for symbols, listing
+files, and safe path handling. It contains no injected bug and no ground truth
+yet.
+
+Tests copy it into a temporary directory before adding hostile entries
+(escaping symlinks, binary files, ignored directories), so the committed copy
+stays plain files only.
+
+## Future evaluation fixtures
+
+Each evaluation fixture will live in its own directory and contain:
 
 - the repository under investigation (or a script that materialises it),
 - a `fixture.json` validated by `FixtureSchema` from `@devpilot/eval`, holding
@@ -13,5 +26,3 @@ Each fixture will live in its own directory and contain:
 Ground truth belongs here, next to the fixture data. Engine, planner, tool, and
 evaluator code must never contain fixture-specific answers, search terms, or
 report text.
-
-No fixtures exist yet.

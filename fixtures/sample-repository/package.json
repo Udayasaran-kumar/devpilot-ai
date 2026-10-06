@@ -1,0 +1,7 @@
+{
+  "name": "sample-checkout-service",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Fixture repository for DevPilot AI repository tool tests."
+}
