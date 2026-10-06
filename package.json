@@ -1,0 +1,26 @@
+{
+  "name": "devpilot-ai",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Evidence-grounded developer agent that investigates failures, verifies hypotheses, and proves fixes red-to-green.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "cli": "tsx apps/cli/src/index.ts",
+    "test": "node --import tsx --test \"packages/*/test/**/*.test.ts\" \"tests/**/*.test.ts\"",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "check": "npm run typecheck && npm test"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}

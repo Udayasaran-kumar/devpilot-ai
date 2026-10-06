@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+coverage/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Investigation scratch space (temporary git worktrees, run artifacts)
+.devpilot/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,17 @@
+{
+  "name": "@devpilot/tools",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Tool contracts and registry for controlled, schema-validated repository investigation.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "node --import tsx --test \"test/**/*.test.ts\""
+  },
+  "dependencies": {
+    "@devpilot/core": "0.1.0",
+    "zod": "^4.1.0"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "name": "@devpilot/eval",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Evaluation contracts for scoring investigations against fixture ground truth.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@devpilot/core": "0.1.0",
+    "zod": "^4.1.0"
+  }
+}

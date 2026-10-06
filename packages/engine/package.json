@@ -1,0 +1,19 @@
+{
+  "name": "@devpilot/engine",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Event-sourced investigation engine with step and time budgets.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "node --import tsx --test \"test/**/*.test.ts\""
+  },
+  "dependencies": {
+    "@devpilot/core": "0.1.0",
+    "@devpilot/planners": "0.1.0",
+    "@devpilot/tools": "0.1.0",
+    "zod": "^4.1.0"
+  }
+}

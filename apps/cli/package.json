@@ -1,0 +1,15 @@
+{
+  "name": "@devpilot/cli",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Command-line interface for DevPilot AI.",
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "@devpilot/engine": "0.1.0",
+    "@devpilot/planners": "0.1.0",
+    "@devpilot/tools": "0.1.0"
+  }
+}

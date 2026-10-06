@@ -1,0 +1,16 @@
+{
+  "name": "@devpilot/core",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Domain schemas shared by every DevPilot AI package: signals, evidence, hypotheses, verification, reports, and events.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "node --import tsx --test \"test/**/*.test.ts\""
+  },
+  "dependencies": {
+    "zod": "^4.1.0"
+  }
+}
