@@ -37,7 +37,7 @@ describe('search_code', () => {
     assert.deepEqual(
       output.matches.map(({ path: file, line, column, text }) => ({ file, line, column, text })),
       [
-        { file: 'src/checkout.ts', line: 2, column: 10, text: "import { applyDiscount } from './discounts.js';" },
+        { file: 'src/checkout.ts', line: 2, column: 10, text: "import { applyDiscount } from './discounts.ts';" },
         {
           file: 'src/checkout.ts',
           line: 32,

@@ -1,11 +1,17 @@
 import { constants, type Dirent } from 'node:fs';
 import { lstat, open, readdir, realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
+import type { CommandExecutionResult } from '@devpilot/core';
+import { buildCommandEnvironment, type HostEnvironment } from './command-environment.js';
+import { DEFAULT_COMMAND_POLICY, type CommandPolicy } from './command-policy.js';
+import { isWithin } from './paths.js';
+import { runProcess } from './process-runner.js';
 import { splitLines } from './text.js';
 
 export type SandboxErrorCode =
   | 'invalid_path'
   | 'invalid_argument'
+  | 'command_not_allowed'
   | 'outside_root'
   | 'not_found'
   | 'not_a_file'
@@ -79,10 +85,23 @@ export interface ListResult {
   readonly truncated: boolean;
 }
 
+export interface CommandRequest {
+  readonly command: string;
+  readonly args: readonly string[];
+  /** Working directory relative to the repository root (or absolute inside it). Defaults to the root. */
+  readonly cwd?: string;
+  readonly timeoutMs?: number;
+}
+
 export interface RepositorySandboxOptions {
   readonly maxFileBytes?: number;
   /** Directory names never descended into while walking. Explicitly requested paths are still allowed. */
   readonly ignoredDirectoryNames?: readonly string[];
+  readonly commandPolicy?: CommandPolicy;
+  /** Source of passthrough variables for commands. Defaults to `process.env`. */
+  readonly hostEnvironment?: HostEnvironment;
+  /** Overrides the default passthrough variable names; secret-looking names are still dropped. */
+  readonly envPassthrough?: readonly string[];
 }
 
 export const DEFAULT_MAX_FILE_BYTES = 1024 * 1024;
@@ -92,6 +111,11 @@ export const MAX_SEARCH_RESULTS = 500;
 export const DEFAULT_LIST_RESULTS = 200;
 export const MAX_LIST_RESULTS = 2000;
 export const MAX_MATCH_LINE_LENGTH = 500;
+export const DEFAULT_COMMAND_TIMEOUT_MS = 10_000;
+export const MAX_COMMAND_TIMEOUT_MS = 30_000;
+export const MAX_COMMAND_OUTPUT_BYTES = 64 * 1024;
+/** Replaces the repository root in captured command output. */
+export const REPOSITORY_ROOT_PLACEHOLDER = '<repo>';
 
 const BINARY_SNIFF_BYTES = 8192;
 const OPEN_READ_NO_FOLLOW = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0);
@@ -101,9 +125,11 @@ interface WalkEntry extends RepositoryEntry {
 }
 
 /**
- * Read-only view of a single repository directory. Every path is resolved
- * lexically and then through `realpath`, and must stay inside the canonical
- * root after symlinks are followed. Walks never follow symlinks.
+ * View of a single repository directory. Every path is resolved lexically and
+ * then through `realpath`, and must stay inside the canonical root after
+ * symlinks are followed. Walks never follow symlinks. Commands must pass the
+ * command policy and run without a shell, inside the root, with a filtered
+ * environment, a timeout, and bounded output capture.
  */
 export class RepositorySandbox {
   /** Canonical (realpath) repository root. */
@@ -111,12 +137,22 @@ export class RepositorySandbox {
   readonly #rootAliases: readonly string[];
   readonly #maxFileBytes: number;
   readonly #ignoredDirectoryNames: ReadonlySet<string>;
+  readonly #commandPolicy: CommandPolicy;
+  readonly #hostEnvironment: HostEnvironment;
+  readonly #envPassthrough: readonly string[] | undefined;
 
   private constructor(root: string, rootAliases: readonly string[], options: RepositorySandboxOptions) {
     this.root = root;
     this.#rootAliases = rootAliases;
     this.#maxFileBytes = options.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES;
     this.#ignoredDirectoryNames = new Set(options.ignoredDirectoryNames ?? DEFAULT_IGNORED_DIRECTORY_NAMES);
+    this.#commandPolicy = options.commandPolicy ?? DEFAULT_COMMAND_POLICY;
+    this.#hostEnvironment = options.hostEnvironment ?? process.env;
+    this.#envPassthrough = options.envPassthrough;
+  }
+
+  get allowedCommands(): readonly string[] {
+    return this.#commandPolicy.allowedCommands;
   }
 
   static async create(root: string, options: RepositorySandboxOptions = {}): Promise<RepositorySandbox> {
@@ -263,6 +299,50 @@ export class RepositorySandbox {
     return { scope: scope.relativePath, entries, truncated };
   }
 
+  /**
+   * Runs an allowlisted command. Policy rejections and unsafe working
+   * directories throw `SandboxError` before anything is spawned; process
+   * outcomes (non-zero exit, timeout, failure to start) are returned as data.
+   */
+  async runCommand(request: CommandRequest): Promise<CommandExecutionResult> {
+    const decision = this.#commandPolicy.check(request.command, request.args);
+    if (!decision.allowed) {
+      throw new SandboxError('command_not_allowed', decision.reason);
+    }
+    const timeoutMs = resolveLimit(request.timeoutMs, DEFAULT_COMMAND_TIMEOUT_MS, MAX_COMMAND_TIMEOUT_MS, 'timeoutMs');
+    const requestedCwd = request.cwd ?? '.';
+    const cwd = await this.resolveSafePath(requestedCwd);
+    if (cwd.type !== 'directory') {
+      throw new SandboxError('not_a_directory', `Working directory is a file, not a directory: ${requestedCwd}`);
+    }
+
+    const outcome = await runProcess({
+      command: request.command,
+      args: request.args,
+      cwd: cwd.absolutePath,
+      env: buildCommandEnvironment(this.#hostEnvironment, {
+        ...(this.#envPassthrough ? { passthrough: this.#envPassthrough } : {}),
+        excludedPathRoots: this.#rootAliases,
+      }),
+      timeoutMs,
+      maxOutputBytes: MAX_COMMAND_OUTPUT_BYTES,
+    });
+    return {
+      command: request.command,
+      args: [...request.args],
+      cwd: cwd.relativePath,
+      ...outcome,
+      stdout: this.#redactRoot(outcome.stdout),
+      stderr: this.#redactRoot(outcome.stderr),
+    };
+  }
+
+  #redactRoot(text: string): string {
+    return [...this.#rootAliases]
+      .sort((a, b) => b.length - a.length)
+      .reduce((redacted, root) => redacted.split(root).join(REPOSITORY_ROOT_PLACEHOLDER), text);
+  }
+
   async *#walk(directory: string): AsyncGenerator<WalkEntry> {
     const dirents = await readdir(directory, { withFileTypes: true });
     dirents.sort((a, b) => compareCodeUnits(a.name, b.name));
@@ -313,14 +393,6 @@ export class RepositorySandbox {
   }
 }
 
-function isWithin(root: string, target: string): boolean {
-  const relative = path.relative(root, target);
-  return (
-    relative === '' ||
-    (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`))
-  );
-}
-
 async function nearestExistingRealpath(candidate: string): Promise<string> {
   let current = candidate;
   for (;;) {
@@ -361,12 +433,12 @@ function decodeText(buffer: Buffer, relativePath: string): string {
   }
 }
 
-function resolveLimit(requested: number | undefined, fallback: number, cap: number): number {
+function resolveLimit(requested: number | undefined, fallback: number, cap: number, name = 'maxResults'): number {
   if (requested === undefined) {
     return fallback;
   }
   if (!Number.isInteger(requested) || requested < 1) {
-    throw new SandboxError('invalid_argument', 'maxResults must be a positive integer');
+    throw new SandboxError('invalid_argument', `${name} must be a positive integer`);
   }
   return Math.min(requested, cap);
 }

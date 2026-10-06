@@ -27,6 +27,8 @@ const EXPECTED_ROOT_LISTING = [
   { path: 'src/payment', type: 'directory' },
   { path: 'src/payment/fake-gateway.ts', type: 'file' },
   { path: 'src/payment/gateway.ts', type: 'file' },
+  { path: 'test', type: 'directory' },
+  { path: 'test/checkout.test.ts', type: 'file' },
 ];
 
 describe('list_files', () => {

@@ -3,5 +3,8 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Fixture repository for DevPilot AI repository tool tests."
+  "description": "Fixture repository for DevPilot AI repository tool tests.",
+  "scripts": {
+    "test": "node --experimental-strip-types --disable-warning=ExperimentalWarning --test test/checkout.test.ts"
+  }
 }

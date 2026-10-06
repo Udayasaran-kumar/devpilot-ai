@@ -9,10 +9,10 @@ proving it red-to-green in an isolated git worktree.
 Built for the Build, Ship, Shape: Amazon Developer Hackathon.
 
 > Status: early. Domain schemas, the event-sourced engine skeleton, planner
-> contracts, a minimal CLI, and sandboxed read-only repository tools
-> (`read_file`, `search_code`, `list_files`) exist. Command execution, git
-> worktrees, the Bedrock planner, MCP server, HTTP API, and web UI are not
-> implemented yet.
+> contracts, a minimal CLI, sandboxed repository tools (`read_file`,
+> `search_code`, `list_files`, `run_command`), and RED/GREEN verification of
+> command results exist. Git worktrees, patching, the Bedrock planner, MCP
+> server, HTTP API, and web UI are not implemented yet.
 
 ## Principles
 
@@ -41,8 +41,8 @@ apps/
 packages/
   core/       Zod schemas: Signal, Evidence, Hypothesis, InvestigationAction,
               VerificationResult, Report, InvestigationEvent
-  tools/      Tool contract and registry, RepositorySandbox, and the read-only
-              read_file, search_code, and list_files tools
+  tools/      Tool contract and registry, RepositorySandbox, CommandPolicy, and
+              the read_file, search_code, list_files, and run_command tools
   planners/   Planner contract, PlannerDecision schema, RulePlanner placeholder
   engine/     InvestigationState, reducer, InvestigationSession, InvestigationEngine
   eval/       Fixture, GroundTruth, EvaluationResult, Evaluator contracts
@@ -65,10 +65,34 @@ files are never returned.
 | `read_file`   | A UTF-8 file or inclusive 1-based line range     | One `source_code` item         |
 | `search_code` | Case-sensitive literal matches, one per line     | One `search_result` per match  |
 | `list_files`  | Sorted recursive listing of files and dirs       | None (structural only)         |
+| `run_command` | Exit code, stdout, stderr, timeout of a command  | One `command_output` item      |
 
-Evidence IDs come from `createEvidenceId` over the tool name, the exact file
+Evidence IDs come from `createEvidenceId` over the tool name, the exact
 location, and the observed content, so the same observation always has the
-same ID. `createDefaultToolRegistry(sandbox)` registers all three tools.
+same ID. `createDefaultToolRegistry(sandbox)` registers all four tools.
+
+### Command execution
+
+`run_command` takes an argv array (`{ "command": "npm", "args": ["test"] }`)
+and never uses a shell. Commands must pass an explicit `CommandPolicy`; the
+default allows only `npm test`, optionally followed by `--` and plain script
+arguments. The working directory must pass the same sandbox checks as file
+paths. Commands get a minimal environment (`PATH`, `HOME`, temp and locale
+variables, plus `NO_COLOR` and npm settings that disable network side
+effects); secret-looking names such as `AWS_*` or `*_API_KEY` are never
+passed, and `PATH` entries that are relative or inside the repository are
+removed. Each run has a timeout (default 10s, maximum 30s) that kills the
+whole process group, and stdout and stderr are each capped at 64 KiB. The
+repository root is replaced with `<repo>` in captured output.
+
+`verifyCommandResult` turns a command result into a `VerificationResult`.
+Exit code 0 is GREEN and non-zero is RED, but a RED run only confirms a
+reproduction when its output contains text taken from the signal; otherwise
+it is `inconclusive`. Timeouts and terminations are `inconclusive`, and
+commands that cannot start are `not_run`.
+
+Real friction encountered while building this is recorded in
+[`HACKATHON_FRICTION_LOG.md`](HACKATHON_FRICTION_LOG.md).
 
 Package dependencies flow one way:
 

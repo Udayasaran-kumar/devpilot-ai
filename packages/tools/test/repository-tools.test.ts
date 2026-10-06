@@ -4,11 +4,11 @@ import { createDefaultToolRegistry, RepositorySandbox } from '../src/index.js';
 import { FIXTURE_ROOT } from './support/sandbox-fixture.js';
 
 describe('createDefaultToolRegistry', () => {
-  it('registers the three read-only repository tools', async () => {
+  it('registers the repository tools', async () => {
     const registry = createDefaultToolRegistry(await RepositorySandbox.create(FIXTURE_ROOT));
     assert.deepEqual(
       registry.list().map((tool) => tool.name),
-      ['read_file', 'search_code', 'list_files'],
+      ['read_file', 'search_code', 'list_files', 'run_command'],
     );
     for (const descriptor of registry.describe()) {
       assert.ok(descriptor.description.length > 0);

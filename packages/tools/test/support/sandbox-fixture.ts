@@ -5,7 +5,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { EvidenceSchema, type Evidence, type JsonValue } from '@devpilot/core';
 import {
+  CommandPolicy,
+  NPM_TEST_RULE,
   RepositorySandbox,
+  type CommandRule,
   type RepositorySandboxOptions,
   type Tool,
   type ToolContext,
@@ -14,6 +17,14 @@ import {
 } from '../../src/index.js';
 
 export const FIXTURE_ROOT = fileURLToPath(new URL('../../../../fixtures/sample-repository', import.meta.url));
+
+/** Test-only rule: lets process-control tests run small `node -e` programs instead of slow npm scripts. */
+export const NODE_TEST_RULE: CommandRule = {
+  command: 'node',
+  description: 'node, for tests only',
+  checkArgs: () => undefined,
+};
+export const TEST_COMMAND_POLICY = new CommandPolicy([NPM_TEST_RULE, NODE_TEST_RULE]);
 export const NOW = '2026-01-01T00:00:00.000Z';
 export const OUTSIDE_SECRET = 'OUTSIDE_SECRET_TOKEN';
 

@@ -71,7 +71,7 @@ describe('read_file', () => {
     assert.equal(clamped.content, '}');
 
     const toLine = expectSuccess(await runTool(tool, { path: 'src/discounts.ts', endLine: 1 })).output;
-    assert.equal(toLine.content, "import type { Cents } from './money.js';");
+    assert.equal(toLine.content, "import type { Cents } from './money.ts';");
   });
 
   it('produces grounded evidence for exactly what was returned', async () => {

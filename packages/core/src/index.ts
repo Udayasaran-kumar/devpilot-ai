@@ -7,3 +7,5 @@ export * from './verification.js';
 export * from './report.js';
 export * from './event.js';
 export * from './grounding.js';
+export * from './command.js';
+export * from './command-verification.js';

@@ -1,4 +1,4 @@
-import type { ChargeRequest, ChargeResult, PaymentGateway } from './gateway.js';
+import type { ChargeRequest, ChargeResult, PaymentGateway } from './gateway.ts';
 
 export class FakePaymentGateway implements PaymentGateway {
   readonly charges: ChargeRequest[] = [];

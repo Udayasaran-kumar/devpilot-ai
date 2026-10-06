@@ -1,7 +1,7 @@
-import type { Cart } from './cart.js';
-import { applyDiscount } from './discounts.js';
-import type { Cents } from './money.js';
-import type { PaymentGateway } from './payment/gateway.js';
+import type { Cart } from './cart.ts';
+import { applyDiscount } from './discounts.ts';
+import type { Cents } from './money.ts';
+import type { PaymentGateway } from './payment/gateway.ts';
 
 export const TAX_RATE = 0.08;
 
@@ -30,7 +30,7 @@ export async function checkout(
   }
   const subtotal = cart.subtotal();
   const discounted = applyDiscount(subtotal, options.discountCode);
-  const tax = Math.round(discounted * TAX_RATE);
+  const tax = Math.round(subtotal * TAX_RATE);
   const total = discounted + tax;
 
   const result = await gateway.charge({
