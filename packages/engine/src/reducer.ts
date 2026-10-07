@@ -2,10 +2,17 @@ import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import {
   checkExclusiveSelection,
+  checkFailureResolution,
+  describeUnresolved,
   findDanglingEvidenceIds,
   formatCommandLine,
+  identifyFailures,
   InvestigationEventSchema,
+  isFailureResolved,
+  sameFailingTests,
   type Evidence,
+  type FailureIdentity,
+  type FailureVerification,
   type InvestigationAction,
   type InvestigationActionRecord,
   type InvestigationEvent,
@@ -190,7 +197,7 @@ export const reduceInvestigation: InvestigationReducer = (state, event) => {
       };
     case 'baseline_verified': {
       const repair = requireRepairPhase(state, event.type, 'started');
-      requireCommandProof(state, repair, event.type, event.verificationId, event.evidenceId, 'red');
+      const proof = requireCommandProof(state, repair, event.type, event.verificationId, event.evidenceId, 'red');
       return {
         ...next,
         repair: {
@@ -199,13 +206,17 @@ export const reduceInvestigation: InvestigationReducer = (state, event) => {
           phaseActionIndex: state.actions.length,
           baselineVerificationId: event.verificationId,
           baselineEvidenceId: event.evidenceId,
+          baselineFailures: requireIdentifiedFailures(event.type, proof),
         },
       };
     }
     case 'worktree_created': {
       const repair = requireRepairPhase(state, event.type, 'baseline_verified');
       requireFreshVerification(repair, event.type, event.verificationId);
-      requireCommandProof(state, repair, event.type, event.verificationId, event.evidenceId, 'red');
+      const proof = requireCommandProof(state, repair, event.type, event.verificationId, event.evidenceId, 'red');
+      if (!sameFailingTests(requireIdentifiedFailures(event.type, proof), repair.baselineFailures ?? [])) {
+        throw new InvestigationStateError('worktree_created requires the unpatched worktree to fail the same tests as the baseline');
+      }
       return {
         ...next,
         repair: {
@@ -253,13 +264,17 @@ export const reduceInvestigation: InvestigationReducer = (state, event) => {
     case 'repair_verified': {
       const repair = requireRepairPhase(state, event.type, 'patch_applied');
       requireFreshVerification(repair, event.type, event.verificationId);
-      requireCommandProof(state, repair, event.type, event.verificationId, event.evidenceId, 'green');
+      const proof = requireCommandProof(state, repair, event.type, event.verificationId, event.evidenceId, 'green');
       const evidenceIndex = (id: string | undefined) => state.evidence.findIndex((item) => item.id === id);
       if (evidenceIndex(event.evidenceId) <= evidenceIndex(repair.patchEvidenceId)) {
         throw new InvestigationStateError('repair_verified must cite command output recorded after the patch');
       }
       if (!sameSet(repair.patchedFiles ?? [], event.changedFiles)) {
         throw new InvestigationStateError('repair_verified changed files must be exactly the patched files');
+      }
+      const editedTests = event.changedFiles.filter((file) => (repair.baselineFailures ?? []).some((failure) => failure.testFile === file));
+      if (editedTests.length > 0) {
+        throw new InvestigationStateError(`repair_verified cannot change ${editedTests.join(', ')}, which declares a baseline failing test`);
       }
       return {
         ...next,
@@ -268,6 +283,7 @@ export const reduceInvestigation: InvestigationReducer = (state, event) => {
           phase: 'verified',
           finalVerificationId: event.verificationId,
           finalEvidenceId: event.evidenceId,
+          failureVerification: requireResolvedFailures(state, repair, proof),
           changedFiles: event.changedFiles,
         },
       };
@@ -365,7 +381,7 @@ function requireCommandProof(
   verificationId: string,
   evidenceId: string,
   outcome: 'red' | 'green',
-): void {
+): CommandProof {
   const verification = state.verifications.findLast((item) => item.id === verificationId);
   if (!verification) {
     throw new InvestigationStateError(`Unknown verification ${verificationId}`);
@@ -405,6 +421,53 @@ function requireCommandProof(
   if (!isRepairCommandInput(action, repair)) {
     throw new InvestigationStateError(`Action ${action.id} did not run the repair command with its exact arguments and timeout`);
   }
+  return { verification, evidence };
+}
+
+interface CommandProof {
+  readonly verification: VerificationResult;
+  readonly evidence: Evidence;
+}
+
+/**
+ * The failing tests of a RED run, read from its evidence here rather than
+ * taken from the verification: the verification must record exactly these.
+ */
+function requireIdentifiedFailures(eventType: string, { verification, evidence }: CommandProof): readonly FailureIdentity[] {
+  const identified = identifyFailures(evidence.content ?? '', evidence.id);
+  if (!identified.ok) {
+    throw new InvestigationStateError(`${eventType} requires failing tests identified in its RED output, but ${identified.reason}`);
+  }
+  if (!isDeepStrictEqual(verification.failures, identified.failures)) {
+    throw new InvestigationStateError(`Verification ${verification.id} does not record the failing tests its evidence ${evidence.id} shows`);
+  }
+  return identified.failures;
+}
+
+/**
+ * Exit code 0 is not enough: every failure identified at baseline must be
+ * reported passing, exactly once, not skipped or todo, by a final run that
+ * shows no sign of stopping early. Re-derived from both evidence items.
+ */
+function requireResolvedFailures(state: InvestigationState, repair: RepairState, { verification, evidence }: CommandProof): FailureVerification {
+  const failures = repair.baselineFailures ?? [];
+  const baseline = state.evidence.find((item) => item.id === repair.baselineEvidenceId);
+  if (failures.length === 0 || !baseline) {
+    throw new InvestigationStateError('repair_verified requires the failing tests identified at baseline');
+  }
+  const expected = checkFailureResolution({
+    failures,
+    baselineContent: baseline.content ?? '',
+    finalContent: evidence.content ?? '',
+    finalEvidenceId: evidence.id,
+  });
+  if (!isDeepStrictEqual(verification.failureVerification, expected)) {
+    throw new InvestigationStateError(`Verification ${verification.id} does not record the failure checks its evidence ${evidence.id} shows`);
+  }
+  if (!isFailureResolved(expected)) {
+    throw new InvestigationStateError(`repair_verified requires every baseline failure to be reported passing: ${describeUnresolved(expected)}`);
+  }
+  return expected;
 }
 
 function isConfirmed(verification: VerificationResult, outcome: 'red' | 'green'): boolean {

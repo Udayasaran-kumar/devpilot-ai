@@ -118,7 +118,36 @@ Environment: macOS, Node.js 22.17.0, npm 11.6.2, TypeScript 7.0.2, tsx 4.23.
   pass/fail counts) can be turned GREEN by a source-only change, without
   touching a test file, test configuration, or `package.json`. A path-based
   patch policy cannot see this.
-- **Workaround:** none in the policy yet. The grounded report checks whether
-  the GREEN output names the previously failing test as passing. If not, it
-  adds a limitation saying only the exit code was verified. A regression test
-  pins the behaviour.
+- **Workaround:** none in the policy (it still judges paths only). Instead,
+  verification no longer trusts the exit code: the failing tests are
+  identified in the baseline RED output, and GREEN is confirmed only if the
+  final output reports each of them passing, in a run with a closing plan
+  and no file reported as a single result. The `process.exit(0)` patch now
+  ends as `verification_inconclusive`.
+
+## `node --test` prints no location for a passing test
+
+- **What happened:** a failing test's TAP result carries
+  `location: '<file>:<line>:<col>'`, but a passing one carries only
+  `duration_ms` and `type`.
+- **Impact:** proving that "the test that failed in `test/a.test.ts` now
+  passes" cannot be read directly from the GREEN output. A same-named test in
+  another file looks the same.
+- **Workaround:** a failing test is identified only if its name and suites
+  are unique in the run, and the final run must report it exactly once, with
+  every baseline test still present and no file-level result for its file.
+  The patch policy keeps test files out of reviewed patches. The report lists
+  this as a limitation.
+
+## A failing `todo` test exits 0, and a skipped test prints `ok`
+
+- **What happened:** `test('...', { todo: true }, ...)` with a failing
+  assertion prints `not ok 2 - ... # TODO` and the run still exits 0;
+  `{ skip: true }` prints `ok 3 - ... # SKIP`.
+- **Impact:** a parser that maps `ok` to passed counts a skipped test as
+  passing, and one that maps `not ok` to failed counts a TODO as a failure
+  even though the command is GREEN. Marking the failing test `todo` or `skip`
+  would otherwise turn the repair command GREEN.
+- **Workaround:** the TAP parser reads the `# SKIP` / `# TODO` directive into
+  an explicit `skipped` / `todo` outcome, and neither counts as the baseline
+  failure passing.

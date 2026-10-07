@@ -1,6 +1,15 @@
 import { formatCommandLine, type CommandExecutionResult } from './command.js';
 import type { EvidenceId } from './evidence.js';
 import {
+  checkFailureResolution,
+  describeUnresolved,
+  failureLabel,
+  identifyFailures,
+  isFailureResolved,
+  type FailureIdentity,
+  type FailureVerification,
+} from './failure-identity.js';
+import {
   VerificationResultSchema,
   type CommandOutcome,
   type VerificationExpectation,
@@ -30,6 +39,19 @@ export interface CommandVerificationInput {
    * to the signal.
    */
   readonly expectedOutput?: readonly string[];
+  /**
+   * Content of the evidence item `evidenceId`. With it, a RED run confirms a
+   * `fails` expectation only if the failing tests can be identified in it
+   * (`failures`).
+   */
+  readonly evidenceContent?: string;
+  /**
+   * For a `passes` expectation: the failures a baseline run identified and the
+   * content of that run's evidence. A GREEN run then confirms the expectation
+   * only if every one of those tests is reported passing (`failureVerification`);
+   * an exit code of 0 alone is not enough.
+   */
+  readonly baseline?: { readonly failures: readonly FailureIdentity[]; readonly content: string };
   readonly completedAt?: string;
 }
 
@@ -43,11 +65,39 @@ export function verifyCommandResult(input: CommandVerificationInput): Verificati
   if (expectedOutput.some((text) => text.length === 0)) {
     throw new RangeError('expectedOutput entries must be non-empty strings');
   }
+  if (input.baseline !== undefined && (input.expectation !== 'passes' || input.evidenceContent === undefined)) {
+    throw new RangeError('baseline failures apply to a "passes" expectation with evidenceContent');
+  }
 
   const { result } = input;
   const commandOutcome = classifyCommandOutcome(result);
   const commandLine = formatCommandLine(result.command, result.args);
-  const [status, summary] = assess(input.expectation, commandOutcome, commandLine, result, expectedOutput);
+  let [status, summary] = assess(input.expectation, commandOutcome, commandLine, result, expectedOutput);
+
+  let failures: readonly FailureIdentity[] | undefined;
+  if (input.expectation === 'fails' && status === 'confirmed' && input.evidenceContent !== undefined) {
+    const identified = identifyFailures(input.evidenceContent, input.evidenceId);
+    if (identified.ok) {
+      failures = identified.failures;
+      summary = `${summary}; failing test(s): ${identified.failures.map(failureLabel).join(', ')}`;
+    } else {
+      status = 'inconclusive';
+      summary = `${summary}, but ${identified.reason}`;
+    }
+  }
+
+  let failureVerification: FailureVerification | undefined;
+  if (input.baseline !== undefined && (commandOutcome === 'green' || commandOutcome === 'red')) {
+    failureVerification = checkFailureResolution({
+      failures: input.baseline.failures,
+      baselineContent: input.baseline.content,
+      finalContent: input.evidenceContent ?? '',
+      finalEvidenceId: input.evidenceId,
+    });
+    if (commandOutcome === 'green') {
+      [status, summary] = assessResolution(`"${commandLine}" exited with code 0 (GREEN)`, failureVerification);
+    }
+  }
 
   return VerificationResultSchema.parse({
     id: input.id,
@@ -58,8 +108,20 @@ export function verifyCommandResult(input: CommandVerificationInput): Verificati
     expectation: input.expectation,
     commandOutcome,
     evidenceIds: [input.evidenceId],
+    ...(failures !== undefined ? { failures } : {}),
+    ...(failureVerification !== undefined ? { failureVerification } : {}),
     ...(input.completedAt !== undefined ? { completedAt: input.completedAt } : {}),
   });
+}
+
+/** A GREEN run against baseline failures: confirmed only when each of them is reported passing. */
+function assessResolution(green: string, verification: FailureVerification): [VerificationStatus, string] {
+  if (isFailureResolved(verification)) {
+    const passed = verification.checks.map((check) => failureLabel(check.failure)).join(', ');
+    return ['confirmed', `${green}, and the previously failing test(s) ${passed} passed`];
+  }
+  const stillFailing = verification.checks.some((check) => check.outcome === 'failed');
+  return [stillFailing ? 'rejected' : 'inconclusive', `${green}, but ${describeUnresolved(verification)}`];
 }
 
 function assess(

@@ -12,7 +12,7 @@ Built for the Build, Ship, Shape: Amazon Developer Hackathon.
 > sandboxed repository tools (`read_file`, `search_code`, `list_files`,
 > `run_command`), RED/GREEN verification of command results, isolated git
 > worktrees, `apply_patch`, a deterministic RED -> PATCH -> GREEN repair
-> workflow, and a deterministic evidence-grounded planner that proposes
+> workflow that verifies the specific failing tests, and a deterministic evidence-grounded planner that proposes
 > patches (with a patch safety policy and a grounded repair report) exist. The
 > Bedrock planner, MCP server, HTTP API, and web UI are not implemented yet.
 
@@ -22,7 +22,8 @@ Built for the Build, Ship, Shape: Amazon Developer Hackathon.
   and a source location. Hypotheses and report claims cite evidence IDs; the
   engine rejects references to evidence that was never collected.
 - **Verified, not asserted.** A fix counts as verified only when the failing
-  command goes from red to green inside a temporary worktree.
+  command goes from red to green inside a temporary worktree, and the
+  specific tests that failed are observed passing.
 - **Event-sourced.** Every state change is a serializable `InvestigationEvent`.
   State is a pure reduction of the event log, so runs can be streamed, stored,
   and replayed.
@@ -94,7 +95,10 @@ repository root is replaced with `<repo>` in captured output.
 Exit code 0 is GREEN and non-zero is RED, but a RED run only confirms a
 reproduction when its output contains text taken from the signal; otherwise
 it is `inconclusive`. Timeouts and terminations are `inconclusive`, and
-commands that cannot start are `not_run`.
+commands that cannot start are `not_run`. Given the command's output, it also
+identifies the failing tests in a RED run, and given a baseline it confirms a
+GREEN run only if those same tests passed (see
+[Failure-specific verification](#failure-specific-verification)).
 
 ### Isolated worktree workspaces
 
@@ -198,19 +202,25 @@ pre-discount subtotal:
    before anything runs if it does not.
 2. `npm test` runs on the original repository. It must exit non-zero **and**
    print the expected failure (`applies tax to the discounted amount`,
-   `200 !== 180`). Already passing gives `baseline_not_red`; timeouts, start
-   failures, or a different failure give `baseline_inconclusive`. No
-   worktree is created.
+   `200 !== 180`). Its TAP output must also name the failing tests, each
+   with a location in the repository; those become the baseline failure
+   identities. Already passing gives `baseline_not_red`; timeouts, start
+   failures, a different failure, or failing tests that cannot be identified
+   give `baseline_inconclusive`. No worktree is created.
 3. A `GitWorktreeWorkspace` is created from `HEAD`. Its files must match the
    original working tree the baseline ran on, and the same command must be a
-   confirmed RED there before the patch. Otherwise the result is
-   `worktree_failed`, so the later GREEN can only be caused by the patch.
+   confirmed RED there before the patch, failing the same tests. Otherwise
+   the result is `worktree_failed`, so the later GREEN can only be caused by
+   the patch.
 4. `apply_patch` applies the diff (`subtotal * TAX_RATE` ->
    `discounted * TAX_RATE`) in the worktree. Any status other than `applied`
    gives `patch_failed`, and the command is not rerun.
 5. The identical command (argv and timeout) runs in the worktree. Only a
-   confirmed GREEN continues; RED is `verification_failed`, timeouts or start
-   failures are `verification_inconclusive`.
+   confirmed GREEN continues, and GREEN needs more than exit code 0: every
+   baseline failure must be reported passing. RED, or a baseline failure that
+   still fails, is `verification_failed`. Timeouts, start failures, and an
+   exit code of 0 that does not show every baseline failure passing are
+   `verification_inconclusive`.
 6. Safety checks, any failure of which is `safety_check_failed`:
    - the original's files and its git metadata (`HEAD`, refs, config, hooks)
      match a fingerprint taken before the baseline;
@@ -220,9 +230,11 @@ pre-discount subtotal:
    - the patch adds no file whose **name** looks like a secret (`.env*`
      except `.env.example`, `*.pem`, `*.key`, `id_rsa`, `.npmrc`,
      `credentials*`, ...). This is a file-name check only; file contents are
-     not scanned.
+     not scanned;
+   - the patch changes no file that declares a baseline failing test.
 7. The result is `repaired`, with the baseline, unpatched-worktree, patch, and
-   final evidence IDs and the changed files. The worktree is kept for review
+   final evidence IDs, the changed files, the baseline failure identities, and
+   the check of each against the final output. The worktree is kept for review
    and the caller removes it. On failure it is removed; if removal itself
    fails, the reason says so, `worktreeRetained` is true, and the workspace is
    returned so the caller can remove it.
@@ -235,19 +247,99 @@ whose evidence is consistent with it and was produced by a `run_command`
 action, planned during that step, with exactly the repair's command,
 arguments, and timeout. The patch evidence must be an `applied` result in the
 same worktree for the requested patch, and `repair_verified` must list exactly
-the patched files. A replayed, reordered, or edited log therefore cannot claim
-a repair either. The log does not record which directory a command ran in;
-that the RED and GREEN runs happened in this repair's worktree is guaranteed
-by the workflow, which only ever builds those tools from the worktree it
-created.
+the patched files. The reducer also re-reads the failing tests from the
+baseline evidence, requires the unpatched worktree to fail the same tests,
+and re-checks the final evidence against them: `repair_verified` is refused
+unless every baseline failure is reported passing. A replayed, reordered, or
+edited log therefore cannot claim a repair either. The log does not record
+which directory a command ran in; that the RED and GREEN runs happened in
+this repair's worktree is guaranteed by the workflow, which only ever builds
+those tools from the worktree it created.
+
+### Failure-specific verification
+
+The goal of verification is narrow: **the failure reproduced at baseline is
+resolved**. That is, the specific tests that failed in the RED run were
+observed passing in the GREEN run. It is not a claim that the patch is
+semantically correct.
+
+A `FailureIdentity` is read from the baseline RED output and from nothing
+else. Callers, planners, and proposals have no field through which to supply
+one, and the strict schemas refuse one if they try:
+
+| Field                                       | From the failing test's TAP result                     |
+| ------------------------------------------- | ------------------------------------------------------ |
+| `testFile`, `line`                          | its `location`, relative to the repository             |
+| `suite`, `testName`                         | the enclosing `# Subtest:` headers and its result line |
+| `resultLine`                                | the result line, verbatim (`not ok 1 - adds numbers`)  |
+| `error`, `expected`, `actual`, `comparison` | the assertion in its YAML block, when present          |
+| `occurrence`                                | the first stack frame inside the repository            |
+| `evidenceId`                                | the RED command output it was read from                |
+
+Every failing test of the run gets an identity. A parent that failed only
+because a subtest failed is represented by that subtest. A run whose failures
+cannot be identified is `baseline_inconclusive`, never repaired. That includes
+a test file that failed as a whole (for example while loading), a failure
+with no location in the repository, and a test name that is not unique.
+
+The TAP parser (`parseTestOutput`, in `@devpilot/core`) reports, for every
+result, its suites and an outcome of `passed`, `failed`, `skipped` (`# SKIP`),
+or `todo` (`# TODO`). It also reports the closing plan (`1..N`) and tests that
+started without a result. Text that a test prints itself is `#`-prefixed by
+the runner and cannot be mistaken for a result.
+
+The final run confirms GREEN only if all of these hold:
+
+- the command exited 0;
+- each baseline failure is reported **exactly once**, matched by suites and
+  name, with outcome `passed`, and not from a different file;
+- the run has a closing plan that matches its top-level results;
+- no test file of a baseline failure is reported as a single result. That is
+  what `node --test` prints for a file that exited before reporting its
+  tests, for example after `process.exit(0)`;
+- every test the baseline reported is still reported;
+- no test started without finishing.
+
+Otherwise the result is `verification_failed` if a baseline failure still
+failed, and `verification_inconclusive` in every other case. Those cases
+include:
+
+- a skipped or TODO target;
+- a target that is not reported at all (deleted, renamed, or the file exited
+  early);
+- a same-named stand-in that makes the name ambiguous;
+- a run that stopped early.
+
+With several baseline failures, all of them must pass. Another test passing
+never counts.
 
 **What `repaired` does not mean, and other limitations:**
 
-- It means the command went from RED to GREEN because of the patch, not that
-  the patch is a correct fix. A patch that edits or deletes the failing test
-  also turns the command GREEN. Proposals from a planner pass the patch
-  safety policy below before they reach the workflow; `RepairWorkflow` called
-  directly does not apply that policy.
+- It means the tests that failed at baseline were observed passing after the
+  patch, not that the patch is a correct fix. Proposals from a planner pass
+  the patch safety policy below, which refuses test files, before they reach
+  the workflow. `RepairWorkflow` called directly does not apply that policy.
+  Either way, a patch may not change a file that declares a baseline failing
+  test (`FailureIdentity.testFile`). The workflow ends with
+  `safety_check_failed`, and the reducer refuses `repair_verified`. This
+  holds whatever the file is called, including test files the policy's
+  naming patterns miss, such as `src/math-test.mjs`. Failure identity also
+  stops a patch from passing off a renamed, deleted, skipped, or replaced
+  test.
+- A malicious source patch can modify the test process itself, for example
+  by replacing what `assert.equal` does, because the patched code runs inside
+  the tests. Output-level failure verification cannot prove the integrity of
+  the test runner. This is outside the guarantee of the current repair
+  verifier.
+- `node --test` prints no location for a passing test, so the final run
+  matches a baseline failure by suites and name. That is unambiguous because
+  the name must be unique in both runs, every baseline test must still be
+  reported, and the target's file must not be reported as a single result.
+  But it is attribution by name, not by location.
+- Only TAP output from `node --test` is understood. Other test runners, and
+  test names that change between runs (for example ones that include a
+  timestamp), end as `baseline_inconclusive` or `verification_inconclusive`
+  rather than `repaired`.
 - The worktree is checked out from `HEAD`. Tracked uncommitted changes,
   untracked files, and gitignored files in the original (other than
   `node_modules`) make the worktree differ from what the baseline tested, so
@@ -423,7 +515,14 @@ way has no reviewed proposal, so its report fails validation.
   GREEN evidence.
 - A claim asserts correctness: "The repair is correct" is always rejected.
   The supported phrasing is "Repair verified against the configured
-  verification command."
+  verification command." and, for each baseline failure, "Verified: the
+  previously failing test "..." (file) passed after the repair.", quoting
+  the final run's result line.
+- A success claim cites GREEN evidence that does not record every baseline
+  failure as passing. An exit code of 0 on its own is not enough. Each
+  baseline failure is also reported as an observation ("Baseline failure:
+  test ... failed on the original repository with `...`") quoting its RED
+  result line.
 - A claim is not one that `buildRepairReport` derives from the same logs, or
   a derived claim is missing. A quote proves only that text exists. A
   free-text statement under a genuine quote ("`tax` should NOT use
@@ -437,7 +536,8 @@ way has no reviewed proposal, so its report fails validation.
   - a different patch: the SHA-256 of the proposal's exact bytes must match
     the workflow's;
   - a different hypothesis or command;
-  - a result that disagrees with its own log;
+  - a result that disagrees with its own log, including its baseline
+    failures and failure checks;
   - a log from another investigation.
 
 **Limitations of the planner:**
@@ -456,13 +556,14 @@ way has no reviewed proposal, so its report fails validation.
 **Limitations of the patch policy (known, not solved):**
 
 - The policy judges paths, not what a line of source does. A source-only
-  patch can still make the verification command GREEN without fixing
-  anything. For example, `process.exit(0);` at the top of an imported module
-  makes `node --test` exit 0 without running a test. Review accepts such a
-  patch from a planner, and the workflow reports `repaired`. The report then
-  says the GREEN output does not show the previously failing test passing,
-  and that only the exit code was verified. A test pins this behaviour.
-  Requiring the failing test to pass by name is future work.
+  patch such as `process.exit(0);` at the top of an imported module still
+  passes review, and it makes `node --test` exit 0 without running a test.
+  It is no longer `repaired`, though: the test file is reported as a single
+  result and the baseline failure is not reported, so the workflow ends with
+  `verification_inconclusive` and the report makes no success claim. A
+  source patch that makes the failing test genuinely pass for the wrong
+  reason (for example by special-casing the asserted input, or by changing
+  the assertion library at import time) is not detected.
 - Scope is per file, not per line. Hunks are located by their content, as
   with `git apply`, so line numbers in a hunk header cannot bound an edit.
   Once a file is grounded by evidence, any change within it passes review.

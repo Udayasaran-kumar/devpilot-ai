@@ -1,7 +1,14 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { describe, it } from 'node:test';
-import type { Evidence, InvestigationEvent, JsonObject, VerificationResult } from '@devpilot/core';
+import {
+  checkFailureResolution,
+  identifyFailures,
+  type Evidence,
+  type InvestigationEvent,
+  type JsonObject,
+  type VerificationResult,
+} from '@devpilot/core';
 import { InvestigationStateError, replayInvestigation } from '../src/index.js';
 
 const NOW = '2026-01-01T00:00:00.000Z';
@@ -25,8 +32,21 @@ const evidence = (id: string, actionId: string, kind: Evidence['kind'], location
   source: { tool: 'test', actionId },
   collectedAt: NOW,
 });
+const tap = (exitCode: number, ...lines: string[]) => [`$ ${COMMAND}`, `exit code: ${exitCode}`, '--- stdout ---', 'TAP version 13', ...lines].join('\n');
+const FAILING_TAP = [
+  '# Subtest: boom',
+  'not ok 1 - boom',
+  '  ---',
+  "  location: '<repo>/test/a.test.ts:3:1'",
+  '  error: |-',
+  '    boom',
+  '  ...',
+  '# Subtest: other',
+  'ok 2 - other',
+  '1..2',
+];
 const output = (actionId: string, exitCode: number, id: string) =>
-  evidence(id, actionId, 'command_output', { type: 'command', command: COMMAND, exitCode }, `exit code: ${exitCode}\nnot ok - boom`);
+  evidence(id, actionId, 'command_output', { type: 'command', command: COMMAND, exitCode }, tap(exitCode, ...FAILING_TAP));
 const RED = output('action-1', 1, 'ev-red');
 const WORKTREE_RED = output('action-2', 1, 'ev-red-worktree');
 const PATCH = evidence('ev-patch', 'action-3', 'patch_application', {
@@ -35,7 +55,7 @@ const PATCH = evidence('ev-patch', 'action-3', 'patch_application', {
   paths: ['src/a.ts'],
   status: 'applied',
 });
-const GREEN = evidence('ev-green', 'action-4', 'command_output', { type: 'command', command: COMMAND, exitCode: 0 }, 'ok');
+const GREEN = evidence('ev-green', 'action-4', 'command_output', { type: 'command', command: COMMAND, exitCode: 0 }, tap(0, 'ok 1 - boom', 'ok 2 - other', '1..2'));
 
 const verification = (
   id: string,
@@ -45,6 +65,26 @@ const verification = (
   evidenceId: string,
   command = COMMAND,
 ): VerificationResult => ({ id, status, summary: id, command, expectation, commandOutcome, evidenceIds: [evidenceId] });
+const failuresIn = (item: Evidence) => {
+  const identified = identifyFailures(item.content ?? '', item.id);
+  assert.ok(identified.ok);
+  return [...identified.failures];
+};
+/** A confirmed RED that records the failing tests its evidence shows. */
+const confirmedRed = (id: string, item: Evidence): VerificationResult => ({
+  ...verification(id, 'fails', 'red', 'confirmed', item.id),
+  failures: failuresIn(item),
+});
+/** A confirmed GREEN that records how its evidence reports the baseline failures. */
+const confirmedGreen = (id: string, item: Evidence, baseline: Evidence = RED): VerificationResult => ({
+  ...verification(id, 'passes', 'green', 'confirmed', item.id),
+  failureVerification: checkFailureResolution({
+    failures: failuresIn(baseline),
+    baselineContent: baseline.content ?? '',
+    finalContent: item.content ?? '',
+    finalEvidenceId: item.id,
+  }),
+});
 
 const planned = (id: string, tool: string, input: JsonObject): Payload => ({
   type: 'action_planned',
@@ -70,11 +110,11 @@ const SUCCESS: readonly Payload[] = [
   },
   planned('action-1', 'run_command', COMMAND_INPUT),
   completed('action-1', RED),
-  { type: 'verification_recorded', verification: verification('ver-baseline', 'fails', 'red', 'confirmed', 'ev-red') },
+  { type: 'verification_recorded', verification: confirmedRed('ver-baseline', RED) },
   { type: 'baseline_verified', verificationId: 'ver-baseline', evidenceId: 'ev-red' },
   planned('action-2', 'run_command', COMMAND_INPUT),
   completed('action-2', WORKTREE_RED),
-  { type: 'verification_recorded', verification: verification('ver-worktree', 'fails', 'red', 'confirmed', 'ev-red-worktree') },
+  { type: 'verification_recorded', verification: confirmedRed('ver-worktree', WORKTREE_RED) },
   {
     type: 'worktree_created',
     workspace: 'repair-1',
@@ -91,7 +131,7 @@ const SUCCESS: readonly Payload[] = [
   },
   planned('action-4', 'run_command', COMMAND_INPUT),
   completed('action-4', GREEN),
-  { type: 'verification_recorded', verification: verification('ver-repair', 'passes', 'green', 'confirmed', 'ev-green') },
+  { type: 'verification_recorded', verification: confirmedGreen('ver-repair', GREEN) },
   { type: 'repair_verified', verificationId: 'ver-repair', evidenceId: 'ev-green', changedFiles: ['src/a.ts'], originalUnchanged: true },
   { type: 'investigation_completed', status: 'completed', reason: 'verified' },
 ];
@@ -314,6 +354,134 @@ describe('repair events', () => {
           originalUnchanged: true,
         });
         assert.throws(() => replay(log), /exactly the patched files/);
+      }
+    });
+  });
+
+  describe('failure identity', () => {
+    const baselineRecorded = position('verification_recorded', 0);
+    const worktreeRecorded = position('verification_recorded', 1);
+    const finalRecorded = position('verification_recorded', 2);
+    const command = (id: string, actionId: string, exitCode: number, ...lines: string[]) =>
+      evidence(id, actionId, 'command_output', { type: 'command', command: COMMAND, exitCode }, tap(exitCode, ...lines));
+    const greenWith = (...lines: string[]) => command('ev-green', 'action-4', 0, ...lines);
+    /** The log with `item` as the final output, recorded honestly unless `recorded` is given. */
+    const finalRun = (item: Evidence, recorded: VerificationResult = confirmedGreen('ver-repair', item)) =>
+      replacing(finalRecorded, { type: 'verification_recorded', verification: recorded }, replacing(FINAL_RUN, completed('action-4', item)));
+    /** Checks rewritten to claim the baseline failure passed, whatever the evidence says. */
+    const forgedPass = (item: Evidence): VerificationResult => {
+      const honest = confirmedGreen('ver-repair', item);
+      assert.ok(honest.failureVerification);
+      return {
+        ...honest,
+        failureVerification: {
+          ...honest.failureVerification,
+          checks: honest.failureVerification.checks.map((check) => ({ ...check, outcome: 'passed' as const, resultLine: 'ok 1 - boom' })),
+          problems: [],
+        },
+      };
+    };
+
+    it('G: records the failing test read from the baseline evidence, and its PASS in the final evidence', () => {
+      const state = replay(SUCCESS);
+      const identity = { testFile: 'test/a.test.ts', line: 3, suite: [], testName: 'boom', resultLine: 'not ok 1 - boom', error: 'boom', evidenceId: 'ev-red' };
+      assert.deepEqual(state.repair?.baselineFailures, [identity]);
+      assert.deepEqual(state.repair?.failureVerification, {
+        evidenceId: 'ev-green',
+        checks: [{ failure: identity, outcome: 'passed', resultLine: 'ok 1 - boom' }],
+        problems: [],
+      });
+    });
+
+    it('H/K: refuses a baseline verification that records failing tests its evidence does not show', () => {
+      const [real] = failuresIn(RED);
+      assert.ok(real);
+      const recordedAs = (failures?: VerificationResult['failures']) =>
+        replay(replacing(baselineRecorded, { type: 'verification_recorded', verification: { ...verification('ver-baseline', 'fails', 'red', 'confirmed', 'ev-red'), ...(failures ? { failures } : {}) } }));
+      assert.throws(() => recordedAs(), /does not record the failing tests its evidence ev-red shows/);
+      assert.throws(() => recordedAs([{ ...real, testName: 'other', resultLine: 'not ok 2 - other' }]), /does not record the failing tests/);
+      assert.throws(() => recordedAs([real, { ...real, testName: 'other' }]), /does not record the failing tests/);
+      assert.throws(() => recordedAs([{ ...real, testFile: 'test/b.test.ts' }]), /does not record the failing tests/);
+    });
+
+    it('refuses a RED baseline whose output names no individually attributable failing test', () => {
+      const cases: Array<[string[], RegExp]> = [
+        [['not ok 1 - boom', '1..1'], /failing test "boom" has no reported location/],
+        [['not ok 1 - test/a.test.ts', '  ---', "  location: '<repo>/test/a.test.ts:1:1'", '  error: boom', '  ...', '1..1'], /failed as a whole/],
+        [[...FAILING_TAP.slice(0, 7), ...FAILING_TAP.slice(0, 7).map((line) => line.replace('1 - boom', '2 - boom')), '1..2'], /reported 2 times/],
+        [['boom', 'Bail out!'], /reports no failing test/],
+      ];
+      for (const [lines, message] of cases) {
+        const red = command('ev-red', 'action-1', 1, ...lines);
+        const log = replacing(baselineRecorded, { type: 'verification_recorded', verification: verification('ver-baseline', 'fails', 'red', 'confirmed', 'ev-red') }, replacing(BASELINE_RUN, completed('action-1', red)));
+        assert.throws(() => replay(log), message);
+      }
+    });
+
+    it('refuses an unpatched worktree run that fails a different test than the baseline', () => {
+      const different = command('ev-red-worktree', 'action-2', 1, 'ok 1 - boom', 'not ok 2 - other', '  ---', "  location: '<repo>/test/a.test.ts:9:1'", '  error: boom', '  ...', '1..2');
+      const log = replacing(worktreeRecorded, { type: 'verification_recorded', verification: confirmedRed('ver-worktree', different) }, replacing(WORKTREE_RUN, completed('action-2', different)));
+      assert.throws(() => replay(log), /fail the same tests as the baseline/);
+    });
+
+    it('K: refuses repair_verified when the final verification records no failure checks, or forged ones', () => {
+      assert.throws(() => replay(finalRun(GREEN, verification('ver-repair', 'passes', 'green', 'confirmed', 'ev-green'))), /does not record the failure checks its evidence ev-green shows/);
+      const honest = confirmedGreen('ver-repair', GREEN);
+      assert.ok(honest.failureVerification);
+      const otherIdentity = { ...honest, failureVerification: { ...honest.failureVerification, checks: honest.failureVerification.checks.map((check) => ({ ...check, failure: { ...check.failure, testName: 'other' } })) } };
+      assert.throws(() => replay(finalRun(GREEN, otherIdentity)), /does not record the failure checks/);
+    });
+
+    it('L: refuses GREEN output in which a different test passed and the baseline failure is absent', () => {
+      const other = greenWith('ok 1 - other', '1..1');
+      assert.throws(() => replay(finalRun(other)), /every baseline failure to be reported passing: the previously failing test "boom" \(test\/a\.test\.ts\) was not reported/);
+      assert.throws(() => replay(finalRun(other, forgedPass(other))), /does not record the failure checks/);
+      const renamed = greenWith('ok 1 - boom (renamed)', 'ok 2 - other', '1..2');
+      assert.throws(() => replay(finalRun(renamed)), /"boom" \(test\/a\.test\.ts\) was not reported/);
+      const nested = greenWith('# Subtest: suite', '    ok 1 - boom', '    1..1', 'ok 1 - suite', 'ok 2 - other', '1..2');
+      assert.throws(() => replay(finalRun(nested)), /"boom" \(test\/a\.test\.ts\) was not reported/, 'a same-named test in another suite is a different test');
+    });
+
+    it('M: refuses GREEN output in which the baseline failure was skipped or marked TODO', () => {
+      const skipped = greenWith('ok 1 - boom # SKIP', 'ok 2 - other', '1..2');
+      assert.throws(() => replay(finalRun(skipped)), /"boom" \(test\/a\.test\.ts\) was skipped/);
+      assert.throws(() => replay(finalRun(skipped, forgedPass(skipped))), /does not record the failure checks/);
+      const todo = greenWith('not ok 1 - boom # TODO', 'ok 2 - other', '1..2');
+      assert.throws(() => replay(finalRun(todo)), /was marked TODO/);
+    });
+
+    it('refuses repair_verified when the patch changed the file that declares a baseline failure', () => {
+      const started = SUCCESS[1];
+      assert.ok(started?.type === 'repair_started');
+      const patchingFiles = (paths: string[]) => {
+        const text = paths.map((file) => `--- a/${file}\n+++ b/${file}\n@@ -1 +1 @@\n-a\n+b\n`).join('');
+        return SUCCESS.map((payload, index): Payload => {
+          if (index === 1) return { ...started, patchSha256: createHash('sha256').update(text).digest('hex') };
+          if (index === PATCH_RUN - 1) return planned('action-3', 'apply_patch', { patch: text });
+          if (index === PATCH_RUN) return completed('action-3', evidence('ev-patch', 'action-3', 'patch_application', { type: 'patch', workspace: 'repair-1', paths, status: 'applied' }));
+          if (payload.type === 'patch_applied') return { ...payload, files: paths.map((file) => ({ path: file, operation: 'modify', additions: 1, deletions: 1 })) };
+          if (payload.type === 'repair_verified') return { ...payload, changedFiles: paths };
+          return payload;
+        });
+      };
+      for (const paths of [['test/a.test.ts'], ['src/a.ts', 'test/a.test.ts']]) {
+        assert.throws(() => replay(patchingFiles(paths)), /repair_verified cannot change test\/a\.test\.ts, which declares a baseline failing test/);
+      }
+      assert.equal(replay(patchingFiles(['test/b.test.ts'])).repair?.phase, 'verified', 'another file is not the baseline failure\'s');
+    });
+
+    it('refuses GREEN output from a run that stopped early or is ambiguous', () => {
+      const cases: Array<[Evidence, RegExp]> = [
+        [greenWith('# Subtest: test/a.test.ts', 'ok 1 - test/a.test.ts', '1..1'), /was not reported.*test\/a\.test\.ts is reported as a single result/],
+        [greenWith('ok 1 - boom', 'ok 2 - other'), /no closing plan/],
+        [greenWith('ok 1 - boom', 'ok 2 - other', '1..3'), /plan announces 3 top-level tests, but 2 were reported/],
+        [greenWith('ok 1 - boom', '1..1'), /does not report 1 test\(s\) the baseline reported: "other"/],
+        [greenWith('ok 1 - boom', 'ok 2 - boom', 'ok 3 - other', '1..3'), /was reported more than once/],
+        [greenWith('ok 1 - boom', '# Subtest: other', '1..1'), /started without a result: "other"/],
+      ];
+      for (const [item, message] of cases) {
+        assert.throws(() => replay(finalRun(item)), message);
+        assert.throws(() => replay(finalRun(item, forgedPass(item))), /does not record the failure checks/);
       }
     });
   });

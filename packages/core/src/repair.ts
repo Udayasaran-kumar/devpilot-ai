@@ -1,6 +1,8 @@
+import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import { IdSchema } from './common.js';
 import { EvidenceIdSchema } from './evidence.js';
+import { FailureIdentitySchema, FailureVerificationSchema, isFailureResolved } from './failure-identity.js';
 import { PatchRequestSchema, PatchStatusSchema } from './patch.js';
 import { SignalSchema } from './signal.js';
 
@@ -31,15 +33,17 @@ export const RepairRequestSchema = z.strictObject({
 export type RepairRequest = z.infer<typeof RepairRequestSchema>;
 
 /**
- * - `repaired`: confirmed RED baseline, patch applied in a worktree, the same command confirmed GREEN there,
- *   and the original repository unchanged.
+ * - `repaired`: confirmed RED baseline with identified failing tests, patch applied in a worktree, the same
+ *   command confirmed GREEN there with each of those tests reported passing, and the original repository unchanged.
  * - `baseline_not_red`: the original repository already passes; no patch was applied.
- * - `baseline_inconclusive`: the baseline timed out, could not start, or failed without the expected output.
+ * - `baseline_inconclusive`: the baseline timed out, could not start, failed without the expected output, or its
+ *   failing tests could not be identified.
  * - `worktree_failed`: the isolated worktree could not be created, does not match the baseline checkout, or the
- *   unpatched worktree does not reproduce the confirmed RED.
+ *   unpatched worktree does not reproduce the confirmed RED with the same failing tests.
  * - `patch_failed`: apply_patch did not return `applied`.
- * - `verification_failed`: the patched worktree is still RED.
- * - `verification_inconclusive`: the verification timed out or could not run.
+ * - `verification_failed`: the patched worktree is still RED, or a baseline failure is still reported failing.
+ * - `verification_inconclusive`: the verification timed out or could not run, or it exited 0 without showing
+ *   every baseline failure passing (skipped, not run, ambiguous, or the run stopped early).
  * - `safety_check_failed`: GREEN, but the original changed, the worktree changed outside the patch or moved its
  *   HEAD, or the patch adds a file whose name looks like a secret.
  * - `error`: an unexpected internal error stopped the workflow.
@@ -79,6 +83,10 @@ export const RepairResultSchema = z
     patchEvidenceId: EvidenceIdSchema.nullable(),
     finalVerificationId: IdSchema.nullable(),
     finalEvidenceId: EvidenceIdSchema.nullable(),
+    /** The failing tests read from the baseline output; empty if the baseline was not a confirmed RED. */
+    baselineFailures: z.array(FailureIdentitySchema),
+    /** How the final run reported each baseline failure; null if no final GREEN or RED run was assessed. */
+    failureVerification: FailureVerificationSchema.nullable(),
     /** Paths changed in the worktree relative to its base commit. */
     changedFiles: z.array(z.string().min(1)),
     /** Null when the check was not reached. */
@@ -120,6 +128,23 @@ export const RepairResultSchema = z
     }
     if (!result.worktreeRetained) {
       context.addIssue({ code: 'custom', path: ['worktreeRetained'], message: 'A repaired result keeps its worktree' });
+    }
+    const verification = result.failureVerification;
+    const resolved =
+      result.baselineFailures.length > 0 &&
+      verification !== null &&
+      verification.evidenceId === result.finalEvidenceId &&
+      isFailureResolved(verification) &&
+      isDeepStrictEqual(
+        verification.checks.map((check) => check.failure),
+        result.baselineFailures,
+      );
+    if (!resolved) {
+      context.addIssue({
+        code: 'custom',
+        path: ['failureVerification'],
+        message: 'A repaired result requires every baseline failure to be reported passing in the final evidence',
+      });
     }
   });
 export type RepairResult = z.infer<typeof RepairResultSchema>;

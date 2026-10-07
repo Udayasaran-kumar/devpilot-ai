@@ -3,6 +3,8 @@ export * from './signal.js';
 export * from './evidence.js';
 export * from './hypothesis.js';
 export * from './action.js';
+export * from './test-output.js';
+export * from './failure-identity.js';
 export * from './verification.js';
 export * from './report.js';
 export * from './event.js';

@@ -30,23 +30,29 @@ const TAP = [
 
 describe('test output parsing', () => {
   it('extracts passing tests, the failing test, its in-repository location, and the compared values', () => {
+    const failure = {
+      name: 'multiplies numbers',
+      ancestors: [],
+      outcome: 'failed',
+      resultLine: 'not ok 2 - multiplies numbers',
+      location: { path: 'test/math.test.ts', line: 9 },
+      failurePosition: { path: 'test/math.test.ts', line: 11 },
+      error: 'Expected values to be strictly equal:\n\n7 !== 12',
+      actual: '7',
+      expected: '12',
+      comparison: '7 !== 12',
+    };
     assert.deepEqual(parseTestOutput(TAP), {
+      results: [{ name: 'adds numbers', ancestors: [], outcome: 'passed', resultLine: 'ok 1 - adds numbers' }, failure],
       passed: [{ name: 'adds numbers', resultLine: 'ok 1 - adds numbers' }],
-      failed: [
-        {
-          name: 'multiplies numbers',
-          resultLine: 'not ok 2 - multiplies numbers',
-          failurePosition: { path: 'test/math.test.ts', line: 11 },
-          actual: '7',
-          expected: '12',
-          comparison: '7 !== 12',
-        },
-      ],
+      failed: [failure],
+      plan: 2,
+      unfinished: [],
     });
   });
 
   it('reports nothing for output it does not recognise', () => {
-    assert.deepEqual(parseTestOutput('FAIL src/math.test.js\n  Expected: 12'), { passed: [], failed: [] });
+    assert.deepEqual(parseTestOutput('FAIL src/math.test.js\n  Expected: 12'), { results: [], passed: [], failed: [], plan: null, unfinished: [] });
   });
 });
 

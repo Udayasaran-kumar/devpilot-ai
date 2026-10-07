@@ -1,5 +1,7 @@
 import type {
   Evidence,
+  FailureIdentity,
+  FailureVerification,
   Hypothesis,
   InvestigationActionRecord,
   InvestigationBudget,
@@ -57,6 +59,8 @@ export interface RepairState {
   readonly phaseActionIndex: number;
   readonly baselineVerificationId?: string;
   readonly baselineEvidenceId?: string;
+  /** The failing tests the reducer read from the baseline evidence; the only targets the final run can prove. */
+  readonly baselineFailures?: readonly FailureIdentity[];
   readonly workspace?: string;
   readonly baseCommit?: string;
   readonly worktreeVerificationId?: string;
@@ -65,6 +69,8 @@ export interface RepairState {
   readonly patchedFiles?: readonly string[];
   readonly finalVerificationId?: string;
   readonly finalEvidenceId?: string;
+  /** Each baseline failure reported passing in the final evidence. */
+  readonly failureVerification?: FailureVerification;
   readonly changedFiles?: readonly string[];
   readonly failure?: { readonly status: RepairFailureStatus; readonly reason: string; readonly worktreeRemoved: boolean };
 }

@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import {
+  failureLabel,
+  isFailureResolved,
   RepairReportSchema,
   type Evidence,
   type GroundedClaim,
@@ -8,7 +10,7 @@ import {
   type RepairReport,
   type RepairResult,
 } from '@devpilot/core';
-import { analyzeInvestigation, parseTestOutput, type Finding, type PlannerContext } from '@devpilot/planners';
+import { analyzeInvestigation, type Finding, type PlannerContext } from '@devpilot/planners';
 import type { InvestigationState } from './state.js';
 
 /**
@@ -109,15 +111,12 @@ export function validateRepairReport(report: RepairReport, sources: ReportSource
     const unknownActions = claim.actionIds.filter((id) => !actionIds.has(id));
     if (unknownActions.length > 0) flag('unknown_action', `cites actions that never ran: ${unknownActions.join(', ')}`);
 
-    if (claim.kind === 'observation' || claim.kind === 'finding') {
-      if (claim.quote === undefined) {
-        flag('missing_quote', `${claim.kind} claims must quote the evidence they rest on`);
-      } else {
-        const quote = claim.quote;
-        if (!claim.evidenceIds.some((id) => evidence.get(id)?.content?.includes(quote) === true)) {
-          flag('quote_not_in_evidence', `none of the cited evidence contains ${JSON.stringify(quote)}`);
-        }
-      }
+    if ((claim.kind === 'observation' || claim.kind === 'finding') && claim.quote === undefined) {
+      flag('missing_quote', `${claim.kind} claims must quote the evidence they rest on`);
+    }
+    const quote = claim.quote;
+    if (quote !== undefined && !claim.evidenceIds.some((id) => evidence.get(id)?.content?.includes(quote) === true)) {
+      flag('quote_not_in_evidence', `none of the cited evidence contains ${JSON.stringify(quote)}`);
     }
 
     const text = wording(claim.statement);
@@ -185,6 +184,13 @@ function checkSources(sources: ReportSources): ReportIssue[] {
   if (run.phase === 'verified' && !isDeepStrictEqual([...result.changedFiles].sort(), [...(run.changedFiles ?? [])].sort())) {
     mismatch('the repair result lists changed files other than its log');
   }
+  if (!isDeepStrictEqual(normalized(result.baselineFailures), normalized(run.baselineFailures ?? []))) {
+    mismatch('the repair result names baseline failures other than its log');
+  }
+  const finalChecks = run.failureVerification ?? state.verifications.findLast((item) => item.id === run.finalVerificationId)?.failureVerification;
+  if (run.phase === 'verified' && !isDeepStrictEqual(normalized(result.failureVerification), normalized(finalChecks))) {
+    mismatch('the repair result reports failure checks other than its log');
+  }
   return issues;
 }
 
@@ -235,13 +241,19 @@ function sha256(text: string): string {
   return createHash('sha256').update(text).digest('hex');
 }
 
-/** The final evidence of a repair the workflow reported `repaired` and whose log reached `verified`. */
+/**
+ * The final evidence of a repair the workflow reported `repaired`, whose log
+ * reached `verified`, and whose final run reported every baseline failure
+ * passing. An exit code of 0 alone does not qualify.
+ */
 function confirmedGreenEvidenceId(sources: ReportSources): string | undefined {
   const repair = sources.repair;
-  if (repair?.result.status !== 'repaired' || repair.state.repair?.phase !== 'verified') return undefined;
-  const id = repair.state.repair.finalEvidenceId;
+  const run = repair?.state.repair;
+  if (repair?.result.status !== 'repaired' || run?.phase !== 'verified') return undefined;
+  const id = run.finalEvidenceId;
   const item = repair.state.evidence.find((candidate) => candidate.id === id);
-  const verification = repair.state.verifications.findLast((candidate) => candidate.id === repair.state.repair?.finalVerificationId);
+  const verification = repair.state.verifications.findLast((candidate) => candidate.id === run.finalVerificationId);
+  const checks = verification?.failureVerification;
   const green =
     item?.kind === 'command_output' &&
     item.location.type === 'command' &&
@@ -249,7 +261,12 @@ function confirmedGreenEvidenceId(sources: ReportSources): string | undefined {
     verification?.status === 'confirmed' &&
     verification.commandOutcome === 'green' &&
     verification.evidenceIds.includes(item.id) &&
-    repair.result.finalEvidenceId === id;
+    repair.result.finalEvidenceId === id &&
+    checks !== undefined &&
+    checks.evidenceId === id &&
+    isFailureResolved(checks) &&
+    (run.baselineFailures?.length ?? 0) > 0 &&
+    isDeepStrictEqual(checks, run.failureVerification);
   return green ? id : undefined;
 }
 
@@ -350,6 +367,15 @@ export function buildRepairReport(input: BuildRepairReportInput): RepairReport {
         quote: expected,
       });
     }
+    for (const failure of state.repair?.baselineFailures ?? []) {
+      addClaim({
+        kind: 'observation',
+        statement: `Baseline failure: test ${failureLabel(failure)}, declared at line ${failure.line}, failed on the original repository${failure.comparison ? ` with \`${failure.comparison}\`` : ''}.`,
+        evidenceIds: [failure.evidenceId],
+        actionIds: [],
+        quote: failure.resultLine,
+      });
+    }
     if (result.patchStatus === 'applied' && result.patchEvidenceId !== null) {
       addClaim({
         kind: 'observation',
@@ -359,10 +385,20 @@ export function buildRepairReport(input: BuildRepairReportInput): RepairReport {
         quote: 'apply_patch: applied',
       });
     }
-    if (result.status === 'repaired' && result.finalEvidenceId !== null) {
+    const checks = state.repair?.phase === 'verified' ? state.repair.failureVerification : undefined;
+    if (result.status === 'repaired' && result.finalEvidenceId !== null && checks && isFailureResolved(checks)) {
+      for (const check of checks.checks) {
+        addClaim({
+          kind: 'verification',
+          statement: `Verified: the previously failing test ${failureLabel(check.failure)} passed after the repair.`,
+          evidenceIds: [checks.evidenceId],
+          actionIds: [],
+          ...(check.resultLine !== undefined ? { quote: check.resultLine } : {}),
+        });
+      }
       addClaim({
         kind: 'verification',
-        statement: `Repair verified against the configured verification command \`${result.verificationCommand}\`: it exited 0 in the patched worktree, and the original repository is unchanged.`,
+        statement: `Repair verified against the configured verification command \`${result.verificationCommand}\`: it exited 0 in the patched worktree, reported every baseline failure as passing, and the original repository is unchanged.`,
         evidenceIds: [result.finalEvidenceId],
         actionIds: [],
       });
@@ -395,12 +431,12 @@ export function buildRepairReport(input: BuildRepairReportInput): RepairReport {
     verification,
     repairStatus: verification.status,
     claims,
-    limitations: limitations(input, selected, failure?.name),
+    limitations: limitations(input, selected),
     createdAt: input.createdAt,
   };
 }
 
-function limitations(input: BuildRepairReportInput, selected: Hypothesis | null, failingTest: string | undefined): string[] {
+function limitations(input: BuildRepairReportInput, selected: Hypothesis | null): string[] {
   const { repair } = input;
   const notes = [
     'Confidence is an evidence-count bound, s / (s + c + 1) over distinct supporting and contradicting evidence items; it is not a probability.',
@@ -416,13 +452,11 @@ function limitations(input: BuildRepairReportInput, selected: Hypothesis | null,
     `Verification covers only \`${repair.result.verificationCommand}\`; behaviour that command does not exercise is unverified.`,
   );
   if (repair.result.status !== 'repaired') notes.push(`The repair was not verified (${repair.result.status}).`);
-  if (repair.result.status === 'repaired' && failingTest !== undefined) {
-    const green = repair.state.evidence.find((item) => item.id === repair.result.finalEvidenceId)?.content ?? '';
-    if (!parseTestOutput(green).passed.some((test) => test.name === failingTest)) {
-      notes.push(
-        `The GREEN output does not report the previously failing test "${failingTest}" as passing; only the exit code of \`${repair.result.verificationCommand}\` was verified, and a change that stops tests from running would also exit 0.`,
-      );
-    }
+  if (repair.result.status === 'repaired') {
+    notes.push(
+      'Verification shows that the tests which failed in the baseline run were reported passing by the same command after the patch; it does not show that the change is correct for behaviour those tests do not assert.',
+      'node --test does not report where a passing test is declared, so each passing result is matched to its baseline failure by test name and enclosing suites, which must be reported exactly once; the run must also report every test the baseline reported, end with its plan, and not report a test file as a single result.',
+    );
   }
   if (repair.result.worktreeRetained && repair.result.worktree) {
     notes.push(`The patch exists only in worktree ${repair.result.worktree}; it is not committed, merged, or applied to the original checkout.`);

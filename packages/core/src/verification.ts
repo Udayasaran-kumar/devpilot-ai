@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { IdSchema, TimestampSchema } from './common.js';
 import { EvidenceIdSchema } from './evidence.js';
+import { FailureIdentitySchema, FailureVerificationSchema } from './failure-identity.js';
 
 export const VerificationStatusSchema = z.enum(['confirmed', 'rejected', 'inconclusive', 'not_run']);
 export type VerificationStatus = z.infer<typeof VerificationStatusSchema>;
@@ -24,6 +25,10 @@ export const VerificationResultSchema = z
     expectation: VerificationExpectationSchema.optional(),
     commandOutcome: CommandOutcomeSchema.optional(),
     evidenceIds: z.array(EvidenceIdSchema),
+    /** For a `fails` expectation: the failing tests read from the RED output. */
+    failures: z.array(FailureIdentitySchema).min(1).optional(),
+    /** For a `passes` expectation against a baseline: how this run reported each baseline failure. */
+    failureVerification: FailureVerificationSchema.optional(),
     completedAt: TimestampSchema.optional(),
   })
   .refine(

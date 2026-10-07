@@ -112,9 +112,29 @@ describe('incident -> evidence -> hypotheses -> proposal -> review -> RED/PATCH/
     );
     for (const claim of report.claims) assert.ok(claim.evidenceIds.length > 0, claim.id);
     const verification = report.claims.filter((claim) => claim.kind === 'verification');
-    assert.equal(verification.length, 1);
-    assert.match(verification[0]?.statement ?? '', /^Repair verified against the configured verification command/);
+    assert.equal(verification.length, 2);
+    assert.deepEqual(verification[0], {
+      id: verification[0]?.id,
+      kind: 'verification',
+      statement: 'Verified: the previously failing test "applies tax to the discounted amount" (test/checkout.test.ts) passed after the repair.',
+      evidenceIds: [run.repair?.result.finalEvidenceId],
+      actionIds: [],
+      quote: 'ok 2 - applies tax to the discounted amount',
+    });
+    assert.match(verification[1]?.statement ?? '', /^Repair verified against the configured verification command `npm test`: it exited 0 in the patched worktree, reported every baseline failure as passing/);
+    const baseline = report.claims.find((claim) => claim.statement.startsWith('Baseline failure:'));
+    assert.deepEqual(
+      [baseline?.kind, baseline?.statement, baseline?.evidenceIds, baseline?.quote],
+      [
+        'observation',
+        'Baseline failure: test "applies tax to the discounted amount" (test/checkout.test.ts), declared at line 20, failed on the original repository with `200 !== 180`.',
+        [run.repair?.result.baselineEvidenceId],
+        'not ok 2 - applies tax to the discounted amount',
+      ],
+    );
     assert.ok(report.limitations.some((note) => /Verification covers only `npm test`/.test(note)));
+    assert.ok(report.limitations.some((note) => /does not show that the change is correct/.test(note)));
+    assert.ok(!report.limitations.some((note) => /only the exit code/.test(note)), 'the GREEN is failure-specific, not exit-code-only');
     assert.ok(!JSON.stringify(report).includes(fixture.root), 'no host paths in the report');
   });
 
@@ -335,6 +355,36 @@ describe('incident -> evidence -> hypotheses -> proposal -> review -> RED/PATCH/
       assert.ok(flagged(unverified({ ...repair.state, verifications: uncited })), 'final verification cites no evidence');
     });
 
+    it('12: success claims need failure-specific evidence; an exit code of 0 alone is not enough', () => {
+      const repair = run.repair;
+      const logged = repair?.state.repair;
+      assert.ok(repair && logged?.failureVerification);
+      const flagged = (state: typeof repair.state) =>
+        validateRepairReport(run.report, { ...sources(), repair: { result: repair.result, state } }).issues.some((issue) => issue.code === 'unverified_success_claim');
+      const { verifications } = repair.state;
+      const { failureVerification, ...exitCodeOnly } = verifications.find((item) => item.id === logged.finalVerificationId) ?? assert.fail();
+      assert.ok(failureVerification);
+      const withFinal = (checks: typeof failureVerification | undefined) =>
+        verifications.map((item) => (item.id === exitCodeOnly.id ? { ...exitCodeOnly, ...(checks ? { failureVerification: checks } : {}) } : item));
+      const withoutChecks = withFinal(undefined);
+      assert.ok(flagged({ ...repair.state, verifications: withoutChecks }), 'GREEN with only an exit code');
+      const skipped = { ...failureVerification, checks: failureVerification.checks.map((check) => ({ ...check, outcome: 'skipped' as const })) };
+      assert.ok(flagged({ ...repair.state, verifications: withFinal(skipped), repair: { ...logged, failureVerification: skipped } }), 'target skipped');
+      const exited = { ...failureVerification, problems: [{ code: 'test_file_exited_early' as const, message: 'exited' }] };
+      assert.ok(flagged({ ...repair.state, verifications: withFinal(exited), repair: { ...logged, failureVerification: exited } }), 'file exited early');
+      assert.ok(flagged({ ...repair.state, repair: { ...logged, baselineFailures: [] } }), 'no baseline failure identity');
+
+      const generic = 'Tests passed.';
+      const claim = { kind: 'verification' as const, statement: generic, evidenceIds: [repair.result.finalEvidenceId ?? ''], actionIds: [] };
+      assert.ok(issues(withClaim(claim), { ...sources(), repair: { result: repair.result, state: { ...repair.state, verifications: withoutChecks } } }).includes('unverified_success_claim'));
+
+      const otherFailure = repair.result.baselineFailures.map((failure) => ({ ...failure, testName: 'reports declined payments' }));
+      includesMessage(run.report, /names baseline failures other than its log/, { ...sources(), repair: { result: { ...repair.result, baselineFailures: otherFailure }, state: repair.state } });
+      includesMessage(run.report, /failure checks other than its log/, { ...sources(), repair: { result: { ...repair.result, failureVerification: skipped }, state: repair.state } });
+      const forgedQuote = run.report.claims.map((item) => (item.statement.startsWith('Verified:') ? { ...item, quote: 'ok 9 - a test that never ran' } : item));
+      assert.ok(validateRepairReport({ ...run.report, claims: forgedQuote }, sources()).issues.some((issue) => issue.code === 'quote_not_in_evidence'));
+    });
+
     it('N: both logs replay from JSON to the same states, and the report validates only against the replayed logs', () => {
       const repair = run.repair;
       assert.ok(repair);
@@ -443,8 +493,9 @@ describe('incident -> evidence -> hypotheses -> proposal -> review -> RED/PATCH/
     assert.ok(unchanged);
   });
 
-  it('I (documented limit): a source patch that stops the tests from running passes the path policy; the report says only the exit code was verified', async () => {
+  it('B: a source patch that stops the tests from running passes the path policy, exits 0, and is still not repaired', async () => {
     const second = await createGitRepositoryFixture(realGit);
+    const before = await snapshotRepository(realGit, second.root);
     const inner = new RulePlanner();
     const disablesTests: Planner = {
       name: 'disables-tests',
@@ -465,14 +516,76 @@ describe('incident -> evidence -> hypotheses -> proposal -> review -> RED/PATCH/
     }).run({ repositoryRoot: second.root, signal: SIGNAL });
     try {
       assert.equal(result.proposal?.status, 'awaiting_verification', 'a path policy cannot see what a source line does');
-      assert.equal(result.repair?.result.status, 'repaired', 'the configured command exits 0');
-      assert.equal(result.grounding.valid, true);
-      const note = /GREEN output does not report the previously failing test "applies tax to the discounted amount" as passing/;
-      assert.ok(result.report.limitations.some((item) => note.test(item)), result.report.limitations.join('\n'));
-      assert.ok(!run.report.limitations.some((item) => note.test(item)), 'the genuine fix shows the failing test passing');
+      const repair = result.repair;
+      assert.ok(repair);
+      assert.equal(repair.result.status, 'verification_inconclusive', repair.result.reason ?? undefined);
+      assert.match(repair.result.reason ?? '', /exited with code 0 \(GREEN\), but the previously failing test "applies tax to the discounted amount" \(test\/checkout\.test\.ts\) was not reported/);
+      assert.equal(repair.state.verifications.at(-1)?.commandOutcome, 'green', 'the configured command did exit 0');
+      assert.equal(repair.workspace, undefined);
+      assert.equal(result.report.repairStatus, 'verification_inconclusive');
+      assert.deepEqual(result.grounding.issues, []);
+      assert.ok(!result.report.claims.some((claim) => claim.kind === 'verification'), 'no claim says the repair worked');
+      assert.ok(result.report.claims.some((claim) => claim.statement.startsWith('Baseline failure: test "applies tax to the discounted amount"')));
+      assert.ok(result.report.limitations.includes('The repair was not verified (verification_inconclusive).'));
+      assert.deepEqual(await snapshotRepository(realGit, second.root), before);
     } finally {
       await result.repair?.workspace?.remove();
       await second.cleanup();
     }
+  });
+
+  it('F: a proposal that renames the failing test is refused by review and never reaches RepairWorkflow', async () => {
+    const inner = new RulePlanner();
+    const renamesTest: Planner = {
+      name: 'renames-test',
+      async next(context) {
+        const decision = await inner.next(context);
+        if (decision.type !== 'propose_patch') return decision;
+        const rename = [
+          '--- a/test/checkout.test.ts',
+          '+++ b/test/checkout.test.ts',
+          '@@ -20 +20 @@',
+          "-test('applies tax to the discounted amount', async () => {",
+          "+test('applies tax after the discount', async () => {",
+          '',
+        ].join('\n');
+        return { ...decision, proposal: { ...decision.proposal, patch: decision.proposal.patch + rename, affectedPaths: [...decision.proposal.affectedPaths, 'test/checkout.test.ts'] } };
+      },
+    };
+    const { result, unchanged } = await runWith(renamesTest, 'renamed');
+    const record = result.investigation.state?.patchProposals.at(-1);
+    assert.equal(record?.status, 'patch_rejected');
+    assert.ok(record?.violations.some((violation) => violation.code === 'test_file' && violation.path === 'test/checkout.test.ts'));
+    assert.equal(result.repair, undefined, 'the workflow never ran');
+    assert.deepEqual(result.grounding.issues, []);
+    assert.ok(unchanged);
+  });
+
+  it('I, J: a planner or proposal cannot supply the failure identity the repair is verified against', async () => {
+    const inner = new RulePlanner();
+    const identity = { testFile: 'test/checkout.test.ts', line: 30, suite: [], testName: 'reports declined payments', resultLine: 'ok 3 - reports declined payments', evidenceId: 'ev-0123456789abcdef' };
+    const smuggling = (field: string): Planner => ({
+      name: `smuggles-${field}`,
+      async next(context) {
+        const decision = await inner.next(context);
+        return decision.type === 'propose_patch' ? { ...decision, proposal: { ...decision.proposal, [field]: [identity] } } : decision;
+      },
+    });
+    for (const field of ['failures', 'baselineFailures', 'failureIdentity']) {
+      const { result, unchanged } = await runWith(smuggling(field), field.toLowerCase());
+      assert.equal(result.investigation.state?.status, 'failed', field);
+      assert.match(result.investigation.state?.terminalReason ?? '', /Unrecognized key|unrecognized/i);
+      assert.equal(result.investigation.state?.patchProposals.length, 0, 'the proposal is never recorded');
+      assert.equal(result.repair, undefined, 'the workflow never ran');
+      assert.ok(unchanged);
+    }
+
+    // The accepted proposal of the main run carries no identity; the repair log's identity came from its own RED output.
+    const proposal = run.proposal?.proposal;
+    assert.ok(proposal && run.repair);
+    assert.ok(!('failures' in proposal) && !('baselineFailures' in proposal));
+    const [failure] = run.repair.result.baselineFailures;
+    assert.equal(failure?.evidenceId, run.repair.result.baselineEvidenceId);
+    assert.equal(run.repair.state.evidence.find((item) => item.id === failure?.evidenceId)?.source.tool, 'run_command');
   });
 });

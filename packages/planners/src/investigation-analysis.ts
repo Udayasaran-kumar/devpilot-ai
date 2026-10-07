@@ -1,5 +1,13 @@
 import path from 'node:path/posix';
-import { isTestPath, type Evidence, type EvidenceId, type InvestigationActionRecord } from '@devpilot/core';
+import {
+  isTestPath,
+  parseTestOutput,
+  type Evidence,
+  type EvidenceId,
+  type InvestigationActionRecord,
+  type TestFailure,
+  type TestRunObservation,
+} from '@devpilot/core';
 import { evaluateArithmetic } from './analysis/arithmetic.js';
 import {
   assertionsIn,
@@ -18,7 +26,6 @@ import {
   type SourceLine,
   type TestBlock,
 } from './analysis/source.js';
-import { parseTestOutput, type TestFailure, type TestRunObservation } from './analysis/test-output.js';
 import type { PlannerContext } from './planner.js';
 
 /** One observation drawn from evidence. `quote` is verbatim text from the first cited evidence item. */

@@ -3,11 +3,14 @@ import { lstat } from 'node:fs/promises';
 import path from 'node:path';
 import { z } from 'zod';
 import {
+  failureLabel,
   formatCommandLine,
   InvestigationEventSchema,
   RepairRequestSchema,
   RepairResultSchema,
+  sameFailingTests,
   verifyCommandResult,
+  type FailureIdentity,
   type InvestigationAction,
   type InvestigationBudget,
   type InvestigationEvent,
@@ -90,8 +93,10 @@ export class RepairRequestError extends Error {
  * registry for the baseline, a `GitWorktreeWorkspace` for isolation, and
  * `run_command` plus `apply_patch` on the worktree's registry.
  * Every step is an event; the reducer refuses `repair_verified` unless the
- * log holds a confirmed RED baseline, a confirmed RED in the unpatched
- * worktree, the applied patch, and a confirmed GREEN run of the same command.
+ * log holds a confirmed RED baseline with identified failing tests, a
+ * confirmed RED of the same tests in the unpatched worktree, the applied
+ * patch, and a confirmed GREEN run of the same command that reports each of
+ * those tests passing.
  */
 export class RepairWorkflow {
   readonly #options: RepairWorkflowOptions;
@@ -178,8 +183,13 @@ type EventPayload = InvestigationEvent extends infer E
 
 type Failure = { readonly ok: false; readonly status: RepairFailureStatus; readonly reason: string };
 type VerificationRun =
-  | { readonly ok: true; readonly verification: VerificationResult; readonly evidenceId: string }
+  | { readonly ok: true; readonly verification: VerificationResult; readonly evidenceId: string; readonly content: string }
   | { readonly ok: false; readonly reason: string; readonly evidenceId: string | null };
+/** The confirmed RED baseline: its failing tests and the output they were read from. */
+interface Baseline {
+  readonly failures: readonly FailureIdentity[];
+  readonly content: string;
+}
 interface RepositoryFingerprint {
   readonly tree: TreeFingerprint;
   readonly git: TreeFingerprint;
@@ -253,7 +263,11 @@ class RepairExecution {
     }
 
     if (failure === undefined) {
-      this.#emit({ type: 'investigation_completed', status: 'completed', reason: 'Repair verified: RED baseline, patch applied, GREEN in the worktree.' });
+      this.#emit({
+        type: 'investigation_completed',
+        status: 'completed',
+        reason: 'Repair verified: RED baseline, patch applied, GREEN in the worktree with every baseline failure passing.',
+      });
     } else {
       await this.#finishFailure(failure);
     }
@@ -265,19 +279,20 @@ class RepairExecution {
     const originalTools = createDefaultToolRegistry(this.#original);
     this.#originalBefore = await this.#fingerprintOriginal();
 
-    // Phase 1: baseline on the original repository must be a confirmed RED reproduction.
+    // Phase 1: baseline on the original repository must be a confirmed RED reproduction with identified failing tests.
     const baseline = await this.#verify(
       originalTools,
       BASELINE_VERIFICATION_ID,
       'fails',
       'Reproduce the incident on the original repository before any change (baseline)',
-      'Command output that fails with the expected failure text (confirmed RED)',
+      'Command output that fails with the expected failure text and names the failing tests (confirmed RED)',
     );
     this.#baselineEvidenceId = baseline.evidenceId;
     if (!baseline.ok) return fail('baseline_inconclusive', baseline.reason);
     const { verification: red } = baseline;
     if (red.status === 'rejected') return fail('baseline_not_red', red.summary);
-    if (red.status !== 'confirmed') return fail('baseline_inconclusive', red.summary);
+    if (red.status !== 'confirmed' || red.failures === undefined) return fail('baseline_inconclusive', red.summary);
+    const failing: Baseline = { failures: red.failures, content: baseline.content };
     this.#emit({ type: 'baseline_verified', verificationId: red.id, evidenceId: baseline.evidenceId });
 
     // Phase 2: an isolated worktree, identical to what the baseline tested, that is RED there too.
@@ -311,12 +326,18 @@ class RepairExecution {
       WORKTREE_BASELINE_VERIFICATION_ID,
       'fails',
       `Reproduce the incident in worktree ${workspace.name} before the patch`,
-      'Command output in the unpatched worktree that fails with the expected failure text (confirmed RED)',
+      'Command output in the unpatched worktree that fails the same tests as the baseline (confirmed RED)',
     );
     this.#worktreeBaselineEvidenceId = control.evidenceId;
     if (!control.ok || control.verification.status !== 'confirmed') {
       const reason = control.ok ? control.verification.summary : control.reason;
       return fail('worktree_failed', `The unpatched worktree does not reproduce the baseline RED: ${reason}`);
+    }
+    if (!sameFailingTests(control.verification.failures ?? [], failing.failures)) {
+      return fail(
+        'worktree_failed',
+        `The unpatched worktree fails ${listFailures(control.verification.failures ?? [])}, not the baseline's ${listFailures(failing.failures)}`,
+      );
     }
     this.#emit({
       type: 'worktree_created',
@@ -347,13 +368,14 @@ class RepairExecution {
     }
     this.#emit({ type: 'patch_applied', evidenceId: this.#patchEvidenceId, files: patch.files });
 
-    // Phase 4: the same command, now expected to pass, in the patched worktree.
+    // Phase 4: the same command, now expected to pass, in the patched worktree, reporting each baseline failure as passing.
     const final = await this.#verify(
       worktreeTools,
       REPAIR_VERIFICATION_ID,
       'passes',
       `Rerun the baseline command in worktree ${workspace.name} after the patch`,
-      'Command output of the same command in the patched worktree that exits 0 (confirmed GREEN)',
+      'Command output of the same command in the patched worktree that exits 0 and reports each baseline failure passing (confirmed GREEN)',
+      failing,
     );
     this.#finalEvidenceId = final.evidenceId;
     if (!final.ok) return fail('verification_inconclusive', final.reason);
@@ -386,6 +408,14 @@ class RepairExecution {
     if (secretLike.length > 0) {
       return fail('safety_check_failed', `The patch adds files named like secrets: ${summarizePaths(secretLike)}`);
     }
+    const baselineTestFiles = new Set(failing.failures.map((failure) => failure.testFile));
+    const editedTests = this.#changedFiles.filter((file) => baselineTestFiles.has(file));
+    if (editedTests.length > 0) {
+      return fail(
+        'safety_check_failed',
+        `The patch changes ${summarizePaths(editedTests)}, which declares a baseline failing test; a test that passes only after its own file changed does not show the baseline failure resolved`,
+      );
+    }
 
     this.#emit({
       type: 'repair_verified',
@@ -397,32 +427,41 @@ class RepairExecution {
     return undefined;
   }
 
-  /** Runs the fixed verification command once and records the verification. */
+  /**
+   * Runs the fixed verification command once and records the verification.
+   * Failing tests are read from the evidence item the tool recorded, the same
+   * text the reducer re-reads; `baseline` makes a GREEN count only if each of
+   * its failures is reported passing.
+   */
   async #verify(
     tools: ToolRegistry,
     id: string,
     expectation: VerificationExpectation,
     rationale: string,
     expectedEvidence: string,
+    baseline?: Baseline,
   ): Promise<VerificationRun> {
     const outcome = await this.#act(tools, RUN_COMMAND_TOOL_NAME, this.#commandInput, rationale, expectedEvidence);
     if (!outcome.ok) return { ok: false, reason: outcome.error, evidenceId: null };
     const output = RunCommandOutputSchema.parse(outcome.output);
     const evidenceId = output.evidenceIds[0];
-    if (evidenceId === undefined) return { ok: false, reason: 'run_command produced no evidence', evidenceId: null };
+    const content = outcome.evidence.find((item) => item.id === evidenceId)?.content;
+    if (evidenceId === undefined || content === undefined) return { ok: false, reason: 'run_command produced no evidence', evidenceId: null };
 
     const assessed = verifyCommandResult({
       id,
       result: output,
       evidenceId,
       expectation,
+      evidenceContent: content,
       ...(expectation === 'fails' ? { expectedOutput: this.#request.verification.expectedFailure } : {}),
+      ...(baseline ? { baseline } : {}),
       completedAt: this.#now(),
     });
     const verification: VerificationResult =
       this.#request.hypothesisId !== undefined ? { ...assessed, hypothesisId: this.#request.hypothesisId } : assessed;
     this.#emit({ type: 'verification_recorded', verification });
-    return { ok: true, verification, evidenceId };
+    return { ok: true, verification, evidenceId, content };
   }
 
   async #act(tools: ToolRegistry, tool: string, input: Readonly<JsonObject>, rationale: string, expectedEvidence: string) {
@@ -528,6 +567,11 @@ class RepairExecution {
       patchEvidenceId: repair.patchEvidenceId ?? this.#patchEvidenceId,
       finalVerificationId: recorded(state, REPAIR_VERIFICATION_ID),
       finalEvidenceId: repair.finalEvidenceId ?? this.#finalEvidenceId,
+      baselineFailures: [...(repair.baselineFailures ?? [])],
+      failureVerification:
+        repair.failureVerification ??
+        state.verifications.findLast((verification) => verification.id === REPAIR_VERIFICATION_ID)?.failureVerification ??
+        null,
       changedFiles: repaired ? [...(repair.changedFiles ?? [])] : this.#changedFiles,
       originalUnchanged: this.#originalUnchanged,
       worktreeRetained: retained !== undefined,
@@ -568,6 +612,10 @@ function recorded(state: InvestigationState, verificationId: string): string | n
 function parentDirectories(file: string): string[] {
   const segments = file.split('/').slice(0, -1);
   return segments.map((_, index) => segments.slice(0, index + 1).join('/'));
+}
+
+function listFailures(failures: readonly FailureIdentity[]): string {
+  return failures.length === 0 ? 'no identified tests' : failures.map(failureLabel).join(', ');
 }
 
 function summarizePaths(paths: readonly string[]): string {
