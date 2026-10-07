@@ -7,6 +7,8 @@ export * from './read-file.js';
 export * from './search-code.js';
 export * from './list-files.js';
 export * from './run-command.js';
+export * from './apply-patch.js';
+export { parseUnifiedDiff, PatchParseError, MAX_PATCH_FILES, type FilePatch, type Hunk } from './unified-diff.js';
 export * from './repository-tools.js';
 export {
   resolveGitExecutable,

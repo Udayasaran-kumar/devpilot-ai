@@ -9,6 +9,9 @@ import {
   HypothesisSchema,
   InvestigationActionSchema,
   InvestigationEventSchema,
+  PatchRequestSchema,
+  PatchResultSchema,
+  PatchStatusSchema,
   ReportSchema,
   SignalSchema,
   VerificationResultSchema,
@@ -56,6 +59,7 @@ describe('core schemas accept valid objects', () => {
       { type: 'command', command: 'npm test', exitCode: 1 },
       { type: 'signal', signalId: 'sig-1' },
       { type: 'url', url: 'https://example.com/build/42' },
+      { type: 'patch', workspace: 'ws-1', paths: ['src/a.ts'] },
     ];
     for (const location of locations) {
       assert.deepEqual(EvidenceLocationSchema.parse(location), location);
@@ -144,6 +148,38 @@ describe('invalid evidence is rejected', () => {
 
   it('rejects report claims without evidence', () => {
     assert.equal(ClaimSchema.safeParse({ id: 'claim-1', statement: 'Ungrounded', evidenceIds: [] }).success, false);
+  });
+});
+
+describe('patch schemas', () => {
+  it('accept a patch request with an optional description and nothing else', () => {
+    assert.deepEqual(PatchRequestSchema.parse({ patch: 'diff' }), { patch: 'diff' });
+    assert.equal(PatchRequestSchema.safeParse({ patch: 'diff', description: 'why' }).success, true);
+    for (const invalid of [{}, { patch: '' }, { patch: 'diff', args: ['--unsafe-paths'] }, { patch: 'diff', description: '' }]) {
+      assert.equal(PatchRequestSchema.safeParse(invalid).success, false, JSON.stringify(invalid));
+    }
+  });
+
+  it('distinguish every patch outcome', () => {
+    assert.deepEqual(PatchStatusSchema.options, [
+      'applied',
+      'rejected',
+      'invalid_patch',
+      'unsafe_path',
+      'workspace_missing',
+      'application_failed',
+    ]);
+    const result = {
+      status: 'unsafe_path',
+      description: null,
+      workspace: 'ws-1',
+      patchSha256: 'a'.repeat(64),
+      files: [{ path: '../x', operation: 'create', additions: 1, deletions: 0 }],
+      affectedPaths: ['../x'],
+      reason: '"../x" contains "." or ".." segments',
+    };
+    assert.deepEqual(PatchResultSchema.parse(result), result);
+    assert.equal(PatchResultSchema.safeParse({ ...result, status: 'failed' }).success, false);
   });
 });
 

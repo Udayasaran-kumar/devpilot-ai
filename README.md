@@ -66,6 +66,7 @@ and oversized files are never returned.
 | `search_code` | Case-sensitive literal matches, one per line     | One `search_result` per match  |
 | `list_files`  | Sorted recursive listing of files and dirs       | None (structural only)         |
 | `run_command` | Exit code, stdout, stderr, timeout of a command  | One `command_output` item      |
+| `apply_patch` | Applies a unified diff, in a worktree only       | One `patch_application` item   |
 
 Evidence IDs come from `createEvidenceId` over the tool name, the exact
 location, and the observed content, so the same observation always has the
@@ -116,6 +117,53 @@ original working tree stays untouched. `getSandbox()` returns a
   probes each `git` on `PATH` with `git --version` and uses the first that
   works, skipping broken shims such as macOS's `/usr/bin/git` before the Xcode
   license is accepted.
+
+### Applying patches
+
+```
+investigation repository   (read-only tools: read_file, search_code, list_files, run_command)
+        |
+isolated git worktree      (GitWorktreeWorkspace, .devpilot/worktrees/<name>)
+        |
+validated apply_patch      (only registered for a worktree)
+        |
+future verification        (RED -> patch -> GREEN in the same worktree)
+```
+
+**Patches are applied only inside the isolated worktree, never to the
+original checkout.** `apply_patch` is registered only by
+`createWorkspaceTools(workspace)` / `createWorkspaceToolRegistry(workspace)`.
+The repository registry (`createDefaultToolRegistry`) stays read-only. The
+tool refuses to run unless its workspace is active, its root still exists,
+and the root is a linked worktree (`.git` is a file) directly under
+`.devpilot/worktrees`.
+
+Input is `{ patch, description? }` and nothing else, so there is no way to
+pass paths, strip levels, or git options. The patch is a git-style unified
+diff (`--- a/<path>`, `+++ b/<path>`, `/dev/null` to create or delete),
+parsed by a strict internal parser and applied in memory. No subprocess,
+shell, or `git apply` is involved.
+
+- **Refused as `invalid_patch`:** prose, malformed headers or hunks, hunk
+  line counts that disagree with their header, binary patches, renames,
+  copies, mode changes, quoted paths, a `diff --git` line that disagrees with
+  its `---`/`+++` lines, or the same file twice.
+- **Refused as `unsafe_path`:** absolute paths, backslashes, `.` or `..`
+  segments, any segment named `.git` or `.devpilot` (case-insensitive), and
+  symlink or submodule modes.
+- **Symlinks:** each target is resolved through the worktree's
+  `RepositorySandbox` and must resolve to exactly its own lexical path. A
+  patch therefore never writes through a symlink, whether the final file or
+  any parent directory, even one pointing inside the worktree.
+- **All-or-nothing:** every hunk must match the current file contents (exact
+  context; a hunk may sit at a different line than its header says). If any
+  file fails, the result is `rejected` and nothing is written. If a write fails
+  part-way, completed writes are rolled back and the result is
+  `application_failed`. Modified files are replaced via a temp file and
+  `rename`, keeping their mode.
+- **Evidence:** every attempt, successful or not, returns one
+  `patch_application` evidence item. It holds the status, reason, workspace
+  name, file list, patch sha256, and patch text, but no host paths.
 
 Real friction encountered while building this is recorded in
 [`HACKATHON_FRICTION_LOG.md`](HACKATHON_FRICTION_LOG.md).

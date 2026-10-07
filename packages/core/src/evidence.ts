@@ -37,6 +37,12 @@ export const EvidenceLocationSchema = z.discriminatedUnion('type', [
     type: z.literal('url'),
     url: z.url(),
   }),
+  z.object({
+    type: z.literal('patch'),
+    /** Name of the isolated worktree workspace the patch targeted. */
+    workspace: z.string().min(1),
+    paths: z.array(z.string().min(1)),
+  }),
 ]);
 export type EvidenceLocation = z.infer<typeof EvidenceLocationSchema>;
 
@@ -48,6 +54,7 @@ export const EvidenceKindSchema = z.enum([
   'stack_frame',
   'search_result',
   'signal_excerpt',
+  'patch_application',
 ]);
 export type EvidenceKind = z.infer<typeof EvidenceKindSchema>;
 

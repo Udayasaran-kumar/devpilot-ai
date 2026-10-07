@@ -9,3 +9,4 @@ export * from './event.js';
 export * from './grounding.js';
 export * from './command.js';
 export * from './command-verification.js';
+export * from './patch.js';
