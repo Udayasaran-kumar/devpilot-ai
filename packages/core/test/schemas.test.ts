@@ -59,7 +59,7 @@ describe('core schemas accept valid objects', () => {
       { type: 'command', command: 'npm test', exitCode: 1 },
       { type: 'signal', signalId: 'sig-1' },
       { type: 'url', url: 'https://example.com/build/42' },
-      { type: 'patch', workspace: 'ws-1', paths: ['src/a.ts'] },
+      { type: 'patch', workspace: 'ws-1', paths: ['src/a.ts'], status: 'applied' },
     ];
     for (const location of locations) {
       assert.deepEqual(EvidenceLocationSchema.parse(location), location);

@@ -94,14 +94,16 @@ export class GitWorktreeWorkspace {
       throw error;
     }
 
-    try {
-      await runGit(git, ['worktree', 'add', '--detach', '--', root, baseCommit], repository, host);
-      const sandbox = await RepositorySandbox.create(root, options.sandboxOptions);
-      return new GitWorktreeWorkspace({ name, repositoryRoot: repository, baseCommit, root, worktreesDirectory, sandbox, git, host });
-    } catch (error) {
-      await discardFailedWorktree(git, repository, worktreesDirectory, root, host);
-      throw error;
-    }
+    return withWorktreeRegistryLock(repository, async () => {
+      try {
+        await runGit(git, ['worktree', 'add', '--detach', '--', root, baseCommit], repository, host);
+        const sandbox = await RepositorySandbox.create(root, options.sandboxOptions);
+        return new GitWorktreeWorkspace({ name, repositoryRoot: repository, baseCommit, root, worktreesDirectory, sandbox, git, host });
+      } catch (error) {
+        await discardFailedWorktree(git, repository, worktreesDirectory, root, host);
+        throw error;
+      }
+    });
   }
 
   get removed(): boolean {
@@ -118,6 +120,12 @@ export class GitWorktreeWorkspace {
   getSandbox(): RepositorySandbox {
     this.#assertActive();
     return this.#sandbox;
+  }
+
+  /** Commit currently checked out in the worktree; differs from `baseCommit` if something committed there. */
+  async head(): Promise<string> {
+    const { stdout } = await runGit(this.#git, ['rev-parse', '--verify', 'HEAD'], this.getRoot(), this.#host);
+    return stdout.trim();
   }
 
   async status(): Promise<WorkspaceStatus> {
@@ -148,7 +156,7 @@ export class GitWorktreeWorkspace {
    * Repeated and concurrent calls share one removal; a failed removal can be retried.
    */
   remove(): Promise<void> {
-    this.#removal ??= this.#remove().catch((error: unknown) => {
+    this.#removal ??= withWorktreeRegistryLock(this.repositoryRoot, () => this.#remove()).catch((error: unknown) => {
       this.#removal = undefined;
       throw error;
     });
@@ -318,6 +326,26 @@ async function inspectWorkspaceDirectory(root: string, worktreesDirectory: strin
 
 function generateWorkspaceName(): string {
   return `${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`;
+}
+
+/**
+ * git does not register worktrees atomically: a concurrent `worktree add` or
+ * `worktree list` can read another worktree's half-written entry and fail.
+ * Registry operations on one repository therefore run one at a time within
+ * this process. Other processes are not coordinated.
+ */
+const registryQueues = new Map<string, Promise<unknown>>();
+
+async function withWorktreeRegistryLock<T>(repository: string, operation: () => Promise<T>): Promise<T> {
+  const previous = registryQueues.get(repository) ?? Promise.resolve();
+  const current = previous.catch(() => undefined).then(operation);
+  const tail = current.catch(() => undefined);
+  registryQueues.set(repository, tail);
+  try {
+    return await current;
+  } finally {
+    if (registryQueues.get(repository) === tail) registryQueues.delete(repository);
+  }
 }
 
 async function realpathOrUndefined(target: string): Promise<string | undefined> {

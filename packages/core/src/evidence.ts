@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { IdSchema, TimestampSchema } from './common.js';
+import { PatchStatusSchema } from './patch.js';
 
 export const EvidenceIdSchema = z
   .string()
@@ -42,6 +43,8 @@ export const EvidenceLocationSchema = z.discriminatedUnion('type', [
     /** Name of the isolated worktree workspace the patch targeted. */
     workspace: z.string().min(1),
     paths: z.array(z.string().min(1)),
+    /** Outcome of the attempt, so an applied patch is distinguishable from a refused one. */
+    status: PatchStatusSchema,
   }),
 ]);
 export type EvidenceLocation = z.infer<typeof EvidenceLocationSchema>;

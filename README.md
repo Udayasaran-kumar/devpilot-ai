@@ -10,9 +10,11 @@ Built for the Build, Ship, Shape: Amazon Developer Hackathon.
 
 > Status: early. Domain schemas, the event-sourced engine skeleton, planner
 > contracts, a minimal CLI, sandboxed repository tools (`read_file`,
-> `search_code`, `list_files`, `run_command`), and RED/GREEN verification of
-> command results exist. Git worktrees, patching, the Bedrock planner, MCP
-> server, HTTP API, and web UI are not implemented yet.
+> `search_code`, `list_files`, `run_command`), RED/GREEN verification of
+> command results, isolated git worktrees, `apply_patch`, and a deterministic
+> RED -> PATCH -> GREEN repair workflow exist. The patch is supplied by the
+> caller; nothing generates fixes yet. The Bedrock planner, MCP server, HTTP
+> API, and web UI are not implemented yet.
 
 ## Principles
 
@@ -44,7 +46,8 @@ packages/
   tools/      Tool contract and registry, RepositorySandbox, CommandPolicy, and
               the read_file, search_code, list_files, and run_command tools
   planners/   Planner contract, PlannerDecision schema, RulePlanner placeholder
-  engine/     InvestigationState, reducer, InvestigationSession, InvestigationEngine
+  engine/     InvestigationState, reducer, InvestigationSession, InvestigationEngine,
+              RepairWorkflow
   eval/       Fixture, GroundTruth, EvaluationResult, Evaluator contracts
 fixtures/     Sample repositories used by tests and evaluation
 tests/        Cross-package integration tests
@@ -127,7 +130,7 @@ isolated git worktree      (GitWorktreeWorkspace, .devpilot/worktrees/<name>)
         |
 validated apply_patch      (only registered for a worktree)
         |
-future verification        (RED -> patch -> GREEN in the same worktree)
+repair workflow            (RED -> patch -> GREEN, see below)
 ```
 
 **Patches are applied only inside the isolated worktree, never to the
@@ -165,6 +168,104 @@ shell, or `git apply` is involved.
   `patch_application` evidence item. It holds the status, reason, workspace
   name, file list, patch sha256, and patch text, but no host paths.
 
+### Repair workflow (RED -> PATCH -> GREEN)
+
+`RepairWorkflow` checks a proposed patch against a failing command. It is a
+deterministic orchestrator over the primitives above; it does not choose,
+write, or improve patches, and it never commits, merges, or pushes.
+
+```
+original repo --run_command (read-only registry)--> RED confirmed?   no -> stop, no worktree
+      |
+GitWorktreeWorkspace (same files as the baseline) --same run_command--> RED?   no -> stop
+      |
+apply_patch (worktree registry)                                       not applied -> stop
+      |
+run_command, same argv, in the worktree --> GREEN confirmed?          no -> stop
+      |
+original unchanged + worktree changes == patched files -> repaired
+```
+
+Using the checkout fixture, whose test fails because tax is charged on the
+pre-discount subtotal:
+
+1. The request carries the repository root, the signal (failing test output),
+   the verification command as argv (`npm`, `["test"]`), expected-failure
+   text copied from the signal, and the patch. There are no fields for a
+   shell, working directory, environment, executable path, or git arguments;
+   the command must pass the `CommandPolicy`, and the request is refused
+   before anything runs if it does not.
+2. `npm test` runs on the original repository. It must exit non-zero **and**
+   print the expected failure (`applies tax to the discounted amount`,
+   `200 !== 180`). Already passing gives `baseline_not_red`; timeouts, start
+   failures, or a different failure give `baseline_inconclusive`. No
+   worktree is created.
+3. A `GitWorktreeWorkspace` is created from `HEAD`. Its files must match the
+   original working tree the baseline ran on, and the same command must be a
+   confirmed RED there before the patch. Otherwise the result is
+   `worktree_failed`, so the later GREEN can only be caused by the patch.
+4. `apply_patch` applies the diff (`subtotal * TAX_RATE` ->
+   `discounted * TAX_RATE`) in the worktree. Any status other than `applied`
+   gives `patch_failed`, and the command is not rerun.
+5. The identical command (argv and timeout) runs in the worktree. Only a
+   confirmed GREEN continues; RED is `verification_failed`, timeouts or start
+   failures are `verification_inconclusive`.
+6. Safety checks, any failure of which is `safety_check_failed`:
+   - the original's files and its git metadata (`HEAD`, refs, config, hooks)
+     match a fingerprint taken before the baseline;
+   - the worktree's `HEAD` is still the base commit;
+   - the files that differ from the baseline tree, by content (including
+     gitignored files) and by `git status`, are exactly the patched files;
+   - the patch adds no file whose **name** looks like a secret (`.env*`
+     except `.env.example`, `*.pem`, `*.key`, `id_rsa`, `.npmrc`,
+     `credentials*`, ...). This is a file-name check only; file contents are
+     not scanned.
+7. The result is `repaired`, with the baseline, unpatched-worktree, patch, and
+   final evidence IDs and the changed files. The worktree is kept for review
+   and the caller removes it. On failure it is removed; if removal itself
+   fails, the reason says so, `worktreeRetained` is true, and the workspace is
+   returned so the caller can remove it.
+
+Each step is an event (`repair_started`, `baseline_verified`,
+`worktree_created`, `patch_applied`, `repair_verified` or `repair_failed`)
+alongside the usual action, evidence, and verification events. The reducer
+checks the proofs itself: each RED or GREEN must be a confirmed verification
+whose evidence is consistent with it and was produced by a `run_command`
+action, planned during that step, with exactly the repair's command,
+arguments, and timeout. The patch evidence must be an `applied` result in the
+same worktree for the requested patch, and `repair_verified` must list exactly
+the patched files. A replayed, reordered, or edited log therefore cannot claim
+a repair either. The log does not record which directory a command ran in;
+that the RED and GREEN runs happened in this repair's worktree is guaranteed
+by the workflow, which only ever builds those tools from the worktree it
+created.
+
+**What `repaired` does not mean, and other limitations:**
+
+- It means the command went from RED to GREEN because of the patch, not that
+  the patch is a correct fix. A patch that edits or deletes the failing test
+  also turns the command GREEN; reviewing what the patch changes is still up
+  to a person (or, later, a policy on which paths a patch may touch).
+- The worktree is checked out from `HEAD`. Tracked uncommitted changes,
+  untracked files, and gitignored files in the original (other than
+  `node_modules`) make the worktree differ from what the baseline tested, so
+  the repair stops with `worktree_failed`; commit or stash them first. Tests
+  that need local, uncommitted configuration (for example a gitignored
+  `.env`) therefore cannot be repaired yet.
+- `node_modules`, `.git`, and `.devpilot` are not compared as files, and the
+  worktree has no `node_modules` of its own. It lives inside the original at
+  `.devpilot/worktrees/<name>`, so module resolution and config discovery
+  that search parent directories can read the original's `node_modules` and
+  files. The RED control run in the unpatched worktree is what keeps such
+  differences from producing a false GREEN.
+- Commands are not sandboxed by the operating system. The checks detect
+  changes inside the repository (files, refs, config, hooks); they cannot
+  see what a test does elsewhere on the machine. Staged changes in the
+  original's index and new objects in its object store are not compared.
+- Worktree creation and removal are serialized per repository within one
+  process; concurrent repairs from separate processes are not coordinated.
+  A process that crashes mid-repair leaves its worktree behind.
+
 Real friction encountered while building this is recorded in
 [`HACKATHON_FRICTION_LOG.md`](HACKATHON_FRICTION_LOG.md).
 
@@ -190,7 +291,9 @@ core  <-  eval
    `time_budget_exhausted`, and `failed`.
 
 Each event passes through `reduceInvestigation`, which enforces gapless
-sequence numbers and refuses events after a terminal state.
+sequence numbers and refuses events after a terminal state. Action IDs are
+unique, an action completes or fails at most once and only after it was
+planned, and evidence must name the action that produced it.
 
 ## Getting started
 

@@ -18,3 +18,4 @@ export {
   type WorkspaceErrorCode,
 } from './git.js';
 export * from './worktree-workspace.js';
+export * from './tree-fingerprint.js';

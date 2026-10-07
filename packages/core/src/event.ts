@@ -1,8 +1,10 @@
 import { z } from 'zod';
 import { IdSchema, JsonValueSchema, TimestampSchema } from './common.js';
 import { InvestigationActionSchema } from './action.js';
-import { EvidenceSchema } from './evidence.js';
+import { EvidenceIdSchema, EvidenceSchema } from './evidence.js';
 import { HypothesisSchema } from './hypothesis.js';
+import { PatchFileChangeSchema } from './patch.js';
+import { RepairFailureStatusSchema } from './repair.js';
 import { SignalSchema } from './signal.js';
 import { VerificationResultSchema } from './verification.js';
 
@@ -74,6 +76,68 @@ export const InvestigationCompletedEventSchema = z.object({
   reason: z.string().min(1),
 });
 
+export const RepairStartedEventSchema = z.object({
+  ...eventBase,
+  type: z.literal('repair_started'),
+  /** Formatted command line used for both the baseline and the final verification. */
+  verificationCommand: z.string().min(1),
+  command: z.string().min(1),
+  args: z.array(z.string()),
+  /** Timeout of every verification run; part of the command's identity. */
+  timeoutMs: z.number().int().positive(),
+  expectedFailure: z.array(z.string().min(1)).min(1),
+  patchSha256: z.string().regex(/^[0-9a-f]{64}$/),
+  description: z.string().min(1).optional(),
+  hypothesisId: IdSchema.optional(),
+});
+
+/** The baseline run on the original repository was a confirmed RED reproduction. */
+export const BaselineVerifiedEventSchema = z.object({
+  ...eventBase,
+  type: z.literal('baseline_verified'),
+  verificationId: IdSchema,
+  evidenceId: EvidenceIdSchema,
+});
+
+/**
+ * The worktree exists, matches the tree the baseline ran on, and the same
+ * command is a confirmed RED there too, before any patch.
+ */
+export const WorktreeCreatedEventSchema = z.object({
+  ...eventBase,
+  type: z.literal('worktree_created'),
+  /** Workspace name under `.devpilot/worktrees`; never a host path. */
+  workspace: z.string().min(1),
+  baseCommit: z.string().min(1),
+  verificationId: IdSchema,
+  evidenceId: EvidenceIdSchema,
+});
+
+export const PatchAppliedEventSchema = z.object({
+  ...eventBase,
+  type: z.literal('patch_applied'),
+  evidenceId: EvidenceIdSchema,
+  files: z.array(PatchFileChangeSchema).min(1),
+});
+
+/** The same verification command was a confirmed GREEN in the patched worktree and the safety checks passed. */
+export const RepairVerifiedEventSchema = z.object({
+  ...eventBase,
+  type: z.literal('repair_verified'),
+  verificationId: IdSchema,
+  evidenceId: EvidenceIdSchema,
+  changedFiles: z.array(z.string().min(1)).min(1),
+  originalUnchanged: z.literal(true),
+});
+
+export const RepairFailedEventSchema = z.object({
+  ...eventBase,
+  type: z.literal('repair_failed'),
+  status: RepairFailureStatusSchema,
+  reason: z.string().min(1),
+  worktreeRemoved: z.boolean(),
+});
+
 export const InvestigationEventSchema = z.discriminatedUnion('type', [
   InvestigationStartedEventSchema,
   ActionPlannedEventSchema,
@@ -82,6 +146,12 @@ export const InvestigationEventSchema = z.discriminatedUnion('type', [
   HypothesesUpdatedEventSchema,
   VerificationRecordedEventSchema,
   InvestigationCompletedEventSchema,
+  RepairStartedEventSchema,
+  BaselineVerifiedEventSchema,
+  WorktreeCreatedEventSchema,
+  PatchAppliedEventSchema,
+  RepairVerifiedEventSchema,
+  RepairFailedEventSchema,
 ]);
 export type InvestigationEvent = z.infer<typeof InvestigationEventSchema>;
 export type InvestigationEventType = InvestigationEvent['type'];

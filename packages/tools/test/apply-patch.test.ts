@@ -361,7 +361,7 @@ describe('apply_patch', () => {
       assert.deepEqual(output.evidenceIds, [item.id]);
       assert.equal(item.kind, 'patch_application');
       assert.deepEqual(item.source, { tool: APPLY_PATCH_TOOL_NAME, actionId: 'action-1' });
-      assert.deepEqual(item.location, { type: 'patch', workspace: workspace.name, paths: ['src/checkout.ts'] });
+      assert.deepEqual(item.location, { type: 'patch', workspace: workspace.name, paths: ['src/checkout.ts'], status: 'applied' });
       assert.equal(item.id, createEvidenceId({ tool: APPLY_PATCH_TOOL_NAME, location: item.location, content: item.content }));
       assert.match(item.summary, /Patch applied to 1 file in worktree/);
       for (const expected of [

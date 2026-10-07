@@ -367,6 +367,7 @@ function createPatchEvidence(result: PatchResult, patch: string, context: ToolCo
     type: 'patch',
     workspace: result.workspace ?? 'none',
     paths: result.affectedPaths,
+    status: result.status,
   };
   const content = renderObservation(result, patch);
   return {

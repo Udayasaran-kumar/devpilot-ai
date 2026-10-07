@@ -1,20 +1,18 @@
-import { z } from 'zod';
 import {
   findDanglingEvidenceIds,
   InvestigationEventSchema,
-  type Evidence,
   type Hypothesis,
   type InvestigationAction,
   type InvestigationBudget,
   type InvestigationEvent,
-  type JsonValue,
   type Signal,
   type TerminalStatus,
 } from '@devpilot/core';
 import { PlannerDecisionSchema, type Planner, type PlannerContext, type PlannerDecision } from '@devpilot/planners';
-import { ToolResultSchema, type ToolRegistry } from '@devpilot/tools';
+import type { ToolRegistry } from '@devpilot/tools';
 import { reduceInvestigation, type InvestigationReducer } from './reducer.js';
 import { isTerminalStatus, type InvestigationState } from './state.js';
+import { describeError, invokeTool } from './tool-invocation.js';
 
 export type InvestigationEventListener = (event: InvestigationEvent) => void;
 
@@ -32,9 +30,6 @@ export interface InvestigationSessionOptions {
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
 type EventPayload = DistributiveOmit<InvestigationEvent, 'investigationId' | 'sequence' | 'timestamp'>;
 type ActDecision = Extract<PlannerDecision, { type: 'act' }>;
-type ToolOutcome =
-  | { readonly ok: true; readonly output: JsonValue; readonly evidence: Evidence[] }
-  | { readonly ok: false; readonly error: string };
 
 /**
  * A single investigation run. Every state change goes through an event, so the
@@ -123,49 +118,10 @@ export class InvestigationSession {
     };
     this.#emit({ type: 'action_planned', action });
 
-    const outcome = await this.#runTool(action);
+    const outcome = await invokeTool(this.#options.tools, action, { investigationId: this.id, now: () => this.#now() });
     return outcome.ok
       ? this.#emit({ type: 'action_completed', actionId: action.id, output: outcome.output, evidence: outcome.evidence })
       : this.#emit({ type: 'action_failed', actionId: action.id, error: outcome.error });
-  }
-
-  async #runTool(action: InvestigationAction): Promise<ToolOutcome> {
-    const tool = this.#options.tools.get(action.tool);
-    if (!tool) {
-      return { ok: false, error: `Unknown tool "${action.tool}"` };
-    }
-
-    const input = tool.inputSchema.safeParse(action.input);
-    if (!input.success) {
-      return { ok: false, error: `Invalid input for tool "${tool.name}": ${z.prettifyError(input.error)}` };
-    }
-
-    let result: z.infer<typeof ToolResultSchema>;
-    try {
-      result = ToolResultSchema.parse(
-        await tool.run(input.data, {
-          investigationId: this.id,
-          actionId: action.id,
-          now: () => this.#now(),
-        }),
-      );
-    } catch (error) {
-      return { ok: false, error: `Tool "${tool.name}" failed: ${describeError(error)}` };
-    }
-    if (result.status === 'error') {
-      return { ok: false, error: result.error };
-    }
-
-    const output = tool.outputSchema.safeParse(result.output);
-    if (!output.success) {
-      return { ok: false, error: `Invalid output from tool "${tool.name}": ${z.prettifyError(output.error)}` };
-    }
-
-    return {
-      ok: true,
-      output: output.data,
-      evidence: result.evidence.map((item) => ({ ...item, source: { tool: tool.name, actionId: action.id } })),
-    };
   }
 
   #updateHypotheses(state: InvestigationState, hypotheses: readonly Hypothesis[]): InvestigationState {
@@ -214,11 +170,4 @@ export class InvestigationSession {
   #now(): string {
     return new Date(this.#options.clock()).toISOString();
   }
-}
-
-function describeError(error: unknown): string {
-  if (error instanceof z.ZodError) {
-    return z.prettifyError(error);
-  }
-  return error instanceof Error ? error.message : String(error);
 }

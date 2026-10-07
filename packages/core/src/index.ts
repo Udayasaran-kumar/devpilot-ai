@@ -10,3 +10,4 @@ export * from './grounding.js';
 export * from './command.js';
 export * from './command-verification.js';
 export * from './patch.js';
+export * from './repair.js';
