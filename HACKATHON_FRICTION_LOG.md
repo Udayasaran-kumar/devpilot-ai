@@ -67,3 +67,20 @@ Environment: macOS, Node.js 22.17.0, npm 11.6.2, TypeScript 7.0.2, tsx 4.23.
 - **What happened:** `/usr/bin/git` refused to run until the Xcode license was
   accepted (`sudo xcodebuild -license`), which needs an interactive terminal.
 - **Workaround:** used Homebrew's `/opt/homebrew/bin/git`.
+
+## The broken system `git` comes first on PATH
+
+- **What happened:** when DevPilot needed to run git itself (for worktrees),
+  `which -a git` listed `/usr/bin/git` before `/opt/homebrew/bin/git`, because
+  `/usr/bin` precedes `/opt/homebrew/bin` on this machine's PATH. The Xcode
+  shim is executable but exits with code 69 and the license message on
+  stderr, so "first `git` on PATH" chooses a git that cannot run.
+- **Impact:** a plain PATH lookup, or spawning `git` by name, fails on a
+  machine that has a perfectly good git installed. Hardcoding the Homebrew
+  path would break Intel Macs (`/usr/local/bin`), Linux, and CI.
+- **Workaround:** `resolveGitExecutable` probes every absolute `git` on PATH
+  with `git --version` and uses the first that succeeds. If none works, the
+  error lists each candidate and why it failed (for example
+  `/usr/bin/git: exited with code 69: You have not agreed to the Xcode license
+  agreements...`). A test puts a fake shim with the same behaviour ahead of a
+  working git on PATH.

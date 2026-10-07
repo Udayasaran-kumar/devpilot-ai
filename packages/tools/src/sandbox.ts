@@ -95,7 +95,10 @@ export interface CommandRequest {
 
 export interface RepositorySandboxOptions {
   readonly maxFileBytes?: number;
-  /** Directory names never descended into while walking. Explicitly requested paths are still allowed. */
+  /**
+   * Entry names skipped while walking, whatever their type (a linked worktree's
+   * `.git` is a file). Explicitly requested paths are still allowed.
+   */
   readonly ignoredDirectoryNames?: readonly string[];
   readonly commandPolicy?: CommandPolicy;
   /** Source of passthrough variables for commands. Defaults to `process.env`. */
@@ -105,7 +108,8 @@ export interface RepositorySandboxOptions {
 }
 
 export const DEFAULT_MAX_FILE_BYTES = 1024 * 1024;
-export const DEFAULT_IGNORED_DIRECTORY_NAMES: readonly string[] = ['.git', 'node_modules'];
+/** `.devpilot` holds DevPilot's own worktrees, which would otherwise duplicate every search result. */
+export const DEFAULT_IGNORED_DIRECTORY_NAMES: readonly string[] = ['.git', '.devpilot', 'node_modules'];
 export const DEFAULT_SEARCH_RESULTS = 50;
 export const MAX_SEARCH_RESULTS = 500;
 export const DEFAULT_LIST_RESULTS = 200;
@@ -349,7 +353,7 @@ export class RepositorySandbox {
     for (const dirent of dirents) {
       const absolutePath = path.join(directory, dirent.name);
       const type = await direntType(dirent, absolutePath);
-      if (type === undefined || (type === 'directory' && this.#ignoredDirectoryNames.has(dirent.name))) {
+      if (type === undefined || this.#ignoredDirectoryNames.has(dirent.name)) {
         continue;
       }
       yield { absolutePath, path: this.#toRepositoryPath(absolutePath), type };

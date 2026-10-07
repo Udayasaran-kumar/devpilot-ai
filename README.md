@@ -57,8 +57,8 @@ repository root. Each requested path is checked lexically, then resolved with
 `realpath` and checked again against the canonical root using path-relative
 comparison (not string prefixes), so `../` traversal, outside absolute paths,
 and symlinks that escape the root are rejected. Directory walks never follow
-symlinks and skip `.git` and `node_modules`; binary, non-UTF-8, and oversized
-files are never returned.
+symlinks and skip `.git`, `.devpilot`, and `node_modules`; binary, non-UTF-8,
+and oversized files are never returned.
 
 | Tool          | Observes                                         | Evidence                       |
 | ------------- | ------------------------------------------------ | ------------------------------ |
@@ -90,6 +90,32 @@ Exit code 0 is GREEN and non-zero is RED, but a RED run only confirms a
 reproduction when its output contains text taken from the signal; otherwise
 it is `inconclusive`. Timeouts and terminations are `inconclusive`, and
 commands that cannot start are `not_run`.
+
+### Isolated worktree workspaces
+
+`GitWorktreeWorkspace.create(repositoryRoot, { allowedRoot })` checks out the
+repository's current commit as a detached `git worktree` at
+`<repository>/.devpilot/worktrees/<name>`, so files can change there while the
+original working tree stays untouched. `getSandbox()` returns a
+`RepositorySandbox` rooted at the worktree, so the repository tools and
+`run_command` work on it unchanged. `remove()` runs `git worktree remove
+--force`, discarding the worktree's changes; it is idempotent.
+
+- The repository must be the top level of a git working tree with at least
+  one commit, inside `allowedRoot` after symlinks are resolved.
+- `.devpilot` and `.devpilot/worktrees` must be real directories, not symlinks.
+  The workspace directory is claimed with an exclusive `mkdir`, so an existing
+  path is never reused. A failed `create` removes what it made.
+- `.devpilot/.gitignore` (containing `*`) is created if missing, so the
+  original repository's `git status` stays clean without editing its own
+  `.gitignore`.
+- `remove()` only deletes the directory it created, and only while it is
+  still a real directory that git lists as a worktree of the repository.
+- git runs from internally built argv arrays without a shell, with hooks and
+  `core.fsmonitor` disabled and a filtered environment. `resolveGitExecutable`
+  probes each `git` on `PATH` with `git --version` and uses the first that
+  works, skipping broken shims such as macOS's `/usr/bin/git` before the Xcode
+  license is accepted.
 
 Real friction encountered while building this is recorded in
 [`HACKATHON_FRICTION_LOG.md`](HACKATHON_FRICTION_LOG.md).

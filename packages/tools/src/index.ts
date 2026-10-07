@@ -8,3 +8,11 @@ export * from './search-code.js';
 export * from './list-files.js';
 export * from './run-command.js';
 export * from './repository-tools.js';
+export {
+  resolveGitExecutable,
+  WorkspaceError,
+  type GitExecutable,
+  type ResolveGitOptions,
+  type WorkspaceErrorCode,
+} from './git.js';
+export * from './worktree-workspace.js';
