@@ -18,7 +18,7 @@ const planned: InvestigationEvent = {
   ...base,
   type: 'action_planned',
   sequence: 1,
-  action: { id: 'action-1', tool: 'search', input: { query: 'save' }, rationale: 'Find save handler', hypothesisIds: [] },
+  action: { id: 'action-1', tool: 'search', input: { query: 'save' }, rationale: 'Find save handler', expectedEvidence: 'Search hits', hypothesisIds: [] },
 };
 
 const completed: InvestigationEvent = {

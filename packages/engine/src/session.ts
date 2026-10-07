@@ -5,11 +5,13 @@ import {
   type InvestigationAction,
   type InvestigationBudget,
   type InvestigationEvent,
+  type PatchProposal,
   type Signal,
   type TerminalStatus,
 } from '@devpilot/core';
 import { PlannerDecisionSchema, type Planner, type PlannerContext, type PlannerDecision } from '@devpilot/planners';
 import type { ToolRegistry } from '@devpilot/tools';
+import { reviewPatchProposal } from './patch-review.js';
 import { reduceInvestigation, type InvestigationReducer } from './reducer.js';
 import { isTerminalStatus, type InvestigationState } from './state.js';
 import { describeError, invokeTool } from './tool-invocation.js';
@@ -98,11 +100,21 @@ export class InvestigationSession {
       return this.#complete('failed', `Planner "${planner.name}" failed: ${describeError(error)}`);
     }
 
+    const accepted = state.patchProposals.find((record) => record.status === 'awaiting_verification');
+    if (accepted && decision.type !== 'finish') {
+      return this.#complete(
+        'failed',
+        `Planner "${planner.name}" chose ${decision.type} after proposal ${accepted.id} passed review; the investigation can only finish`,
+      );
+    }
+
     switch (decision.type) {
       case 'act':
         return this.#act(state, decision);
       case 'update_hypotheses':
         return this.#updateHypotheses(state, decision.hypotheses);
+      case 'propose_patch':
+        return this.#proposePatch(state, decision.proposal);
       case 'finish':
         return this.#complete('completed', decision.reason);
     }
@@ -114,6 +126,7 @@ export class InvestigationSession {
       tool: decision.tool,
       input: decision.input,
       rationale: decision.rationale,
+      expectedEvidence: decision.expectedEvidence,
       hypothesisIds: decision.hypothesisIds ?? [],
     };
     this.#emit({ type: 'action_planned', action });
@@ -130,7 +143,27 @@ export class InvestigationSession {
     if (dangling.length > 0) {
       return this.#complete('failed', `Hypotheses referenced unknown evidence IDs: ${dangling.join(', ')}`);
     }
-    return this.#emit({ type: 'hypotheses_updated', hypotheses: [...hypotheses] });
+    try {
+      return this.#emit({ type: 'hypotheses_updated', hypotheses: [...hypotheses] });
+    } catch (error) {
+      return this.#complete('failed', `Hypothesis update refused: ${describeError(error)}`);
+    }
+  }
+
+  /**
+   * Records the proposal, then reviews it. Accepted proposals wait for the
+   * repair workflow; nothing here applies or runs anything.
+   */
+  #proposePatch(state: InvestigationState, proposal: PatchProposal): InvestigationState {
+    const proposalId = `proposal-${state.patchProposals.length + 1}`;
+    let proposed: InvestigationState;
+    try {
+      proposed = this.#emit({ type: 'patch_proposed', proposalId, proposal });
+    } catch (error) {
+      return this.#complete('failed', `Patch proposal refused: ${describeError(error)}`);
+    }
+    const review = reviewPatchProposal(proposal, proposed);
+    return this.#emit({ type: 'patch_reviewed', proposalId, status: review.status, violations: [...review.violations] });
   }
 
   #complete(status: TerminalStatus, reason: string): InvestigationState {
@@ -153,21 +186,35 @@ export class InvestigationSession {
     return state;
   }
 
+  /** A deep-frozen copy, so a planner cannot alter engine state even by mutating what it is shown. */
   #plannerContext(state: InvestigationState): PlannerContext {
-    return {
-      investigationId: state.investigationId,
-      signal: state.signal,
-      stepCount: state.stepCount,
-      remainingSteps: state.budget.maxSteps - state.stepCount,
-      actions: state.actions,
-      evidence: state.evidence,
-      hypotheses: state.hypotheses,
-      verifications: state.verifications,
-      tools: this.#options.tools.describe(),
-    };
+    return deepFreeze(
+      structuredClone({
+        investigationId: state.investigationId,
+        signal: state.signal,
+        stepCount: state.stepCount,
+        remainingSteps: state.budget.maxSteps - state.stepCount,
+        actions: state.actions,
+        evidence: state.evidence,
+        hypotheses: state.hypotheses,
+        verifications: state.verifications,
+        patchProposals: state.patchProposals,
+        tools: this.#options.tools.describe().map(({ name, description }) => ({ name, description })),
+      }),
+    );
   }
 
   #now(): string {
     return new Date(this.#options.clock()).toISOString();
   }
+}
+
+function deepFreeze<T>(value: T): T {
+  if (typeof value === 'object' && value !== null && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const child of Object.values(value)) {
+      deepFreeze(child);
+    }
+  }
+  return value;
 }

@@ -23,12 +23,12 @@ const rules: PlannerRule[] = [
   {
     name: 'list',
     matches: (context) => context.actions.length === 0,
-    decide: () => ({ type: 'act', tool: 'list_files', input: { path: 'src' }, rationale: 'Survey the source tree' }),
+    decide: () => ({ type: 'act', tool: 'list_files', input: { path: 'src' }, rationale: 'Survey the source tree', expectedEvidence: 'File list' }),
   },
   {
     name: 'search',
     matches: (context) => context.actions.length === 1,
-    decide: () => ({ type: 'act', tool: 'search_code', input: { query: QUERY }, rationale: 'Locate the caller query' }),
+    decide: () => ({ type: 'act', tool: 'search_code', input: { query: QUERY }, rationale: 'Locate the caller query', expectedEvidence: 'Search hits' }),
   },
   {
     name: 'read-first-hit',
@@ -43,6 +43,7 @@ const rules: PlannerRule[] = [
         tool: 'read_file',
         input: { path: hit.location.path, startLine: hit.location.startLine ?? 1 },
         rationale: 'Read the code around the first hit',
+        expectedEvidence: 'Source around the hit',
       };
     },
   },

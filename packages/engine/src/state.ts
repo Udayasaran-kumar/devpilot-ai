@@ -1,8 +1,9 @@
 import type {
   Evidence,
   Hypothesis,
-  InvestigationAction,
+  InvestigationActionRecord,
   InvestigationBudget,
+  PatchProposalRecord,
   RepairFailureStatus,
   Signal,
   TerminalStatus,
@@ -22,12 +23,15 @@ export interface InvestigationState {
   readonly endedAt?: string;
   readonly stepCount: number;
   readonly lastSequence: number;
-  readonly actions: readonly InvestigationAction[];
-  /** IDs of actions that have completed or failed; an action finishes at most once. */
-  readonly finishedActionIds: readonly string[];
+  /** Every planned action with its outcome; an action leaves `planned` at most once. */
+  readonly actions: readonly InvestigationActionRecord[];
   readonly evidence: readonly Evidence[];
   readonly hypotheses: readonly Hypothesis[];
+  /** Evidence items recorded when the hypotheses were last updated; a proposal needs hypotheses assessed against all evidence. */
+  readonly assessedEvidenceCount: number;
   readonly verifications: readonly VerificationResult[];
+  /** Patch proposals in the order they were made, with their review outcome. */
+  readonly patchProposals: readonly PatchProposalRecord[];
   /** Present once `repair_started` has been applied. */
   readonly repair?: RepairState;
 }

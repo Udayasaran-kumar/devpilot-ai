@@ -15,8 +15,9 @@ const signal: Signal = {
   receivedAt: '2026-01-01T00:00:00.000Z',
 };
 
+/** A fake registered under the run_command action type. */
 const fakeReproduce: Tool<{ command: string }, { exitCode: number }> = {
-  name: 'fake_reproduce',
+  name: 'run_command',
   description: 'Pretends to run a command and reports a failing exit code',
   inputSchema: z.object({ command: z.string().min(1) }),
   outputSchema: z.object({ exitCode: z.number().int() }),
@@ -27,12 +28,12 @@ const fakeReproduce: Tool<{ command: string }, { exitCode: number }> = {
       output: { exitCode: 1 },
       evidence: [
         {
-          id: createEvidenceId({ tool: 'fake_reproduce', location, content: 'exit 1' }),
+          id: createEvidenceId({ tool: 'run_command', location, content: 'exit 1' }),
           kind: 'command_output',
           summary: `"${input.command}" exited with code 1`,
           content: 'exit 1',
           location,
-          source: { tool: 'fake_reproduce' },
+          source: { tool: 'run_command' },
           collectedAt: context.now(),
         },
       ],
@@ -46,9 +47,10 @@ const rules: PlannerRule[] = [
     matches: (context) => context.signal.command !== undefined && context.actions.length === 0,
     decide: (context) => ({
       type: 'act',
-      tool: 'fake_reproduce',
+      tool: 'run_command',
       input: { command: context.signal.command ?? '' },
       rationale: 'Reproduce the reported failure before forming hypotheses',
+      expectedEvidence: 'Failing command output',
     }),
   },
 ];

@@ -42,6 +42,7 @@ import {
   type ToolRegistry,
   type TreeFingerprint,
 } from '@devpilot/tools';
+import { SECRET_FILE_PATTERN } from './patch-policy.js';
 import { reduceInvestigation } from './reducer.js';
 import type { InvestigationEventListener } from './session.js';
 import type { InvestigationState } from './state.js';
@@ -52,14 +53,6 @@ export const REPAIR_BUDGET: InvestigationBudget = { maxSteps: 4, maxDurationMs: 
 export const BASELINE_VERIFICATION_ID = 'ver-baseline';
 export const WORKTREE_BASELINE_VERIFICATION_ID = 'ver-worktree-baseline';
 export const REPAIR_VERIFICATION_ID = 'ver-repair';
-
-/**
- * File names a patch must never introduce: env files (except `.env.example`),
- * private keys, and credential stores. This matches names only; file contents
- * are not scanned.
- */
-export const SECRET_FILE_PATTERN =
-  /(^|\/)(\.env(\.(?!example$)[^/]+)?|\.npmrc|\.netrc|\.pgpass|id_(rsa|dsa|ecdsa|ed25519)|[^/]*\.(pem|key|p12|pfx)|credentials[^/]*)$/i;
 
 /** Trusted configuration. Nothing here comes from the repair request. */
 export interface RepairWorkflowOptions {
@@ -278,6 +271,7 @@ class RepairExecution {
       BASELINE_VERIFICATION_ID,
       'fails',
       'Reproduce the incident on the original repository before any change (baseline)',
+      'Command output that fails with the expected failure text (confirmed RED)',
     );
     this.#baselineEvidenceId = baseline.evidenceId;
     if (!baseline.ok) return fail('baseline_inconclusive', baseline.reason);
@@ -317,6 +311,7 @@ class RepairExecution {
       WORKTREE_BASELINE_VERIFICATION_ID,
       'fails',
       `Reproduce the incident in worktree ${workspace.name} before the patch`,
+      'Command output in the unpatched worktree that fails with the expected failure text (confirmed RED)',
     );
     this.#worktreeBaselineEvidenceId = control.evidenceId;
     if (!control.ok || control.verification.status !== 'confirmed') {
@@ -336,7 +331,13 @@ class RepairExecution {
       patch: this.#request.patch,
       ...(this.#request.description !== undefined ? { description: this.#request.description } : {}),
     };
-    const patched = await this.#act(worktreeTools, APPLY_PATCH_TOOL_NAME, patchInput, 'Apply the proposed patch inside the isolated worktree');
+    const patched = await this.#act(
+      worktreeTools,
+      APPLY_PATCH_TOOL_NAME,
+      patchInput,
+      'Apply the proposed patch inside the isolated worktree',
+      'Patch application evidence with status applied',
+    );
     if (!patched.ok) return fail('patch_failed', patched.error);
     const patch = ApplyPatchOutputSchema.parse(patched.output);
     this.#patchStatus = patch.status;
@@ -352,6 +353,7 @@ class RepairExecution {
       REPAIR_VERIFICATION_ID,
       'passes',
       `Rerun the baseline command in worktree ${workspace.name} after the patch`,
+      'Command output of the same command in the patched worktree that exits 0 (confirmed GREEN)',
     );
     this.#finalEvidenceId = final.evidenceId;
     if (!final.ok) return fail('verification_inconclusive', final.reason);
@@ -401,8 +403,9 @@ class RepairExecution {
     id: string,
     expectation: VerificationExpectation,
     rationale: string,
+    expectedEvidence: string,
   ): Promise<VerificationRun> {
-    const outcome = await this.#act(tools, RUN_COMMAND_TOOL_NAME, this.#commandInput, rationale);
+    const outcome = await this.#act(tools, RUN_COMMAND_TOOL_NAME, this.#commandInput, rationale, expectedEvidence);
     if (!outcome.ok) return { ok: false, reason: outcome.error, evidenceId: null };
     const output = RunCommandOutputSchema.parse(outcome.output);
     const evidenceId = output.evidenceIds[0];
@@ -422,12 +425,13 @@ class RepairExecution {
     return { ok: true, verification, evidenceId };
   }
 
-  async #act(tools: ToolRegistry, tool: string, input: Readonly<JsonObject>, rationale: string) {
+  async #act(tools: ToolRegistry, tool: string, input: Readonly<JsonObject>, rationale: string, expectedEvidence: string) {
     const action: InvestigationAction = {
       id: `action-${(this.#state?.actions.length ?? 0) + 1}`,
       tool,
       input: structuredClone(input) as JsonObject,
       rationale,
+      expectedEvidence,
       hypothesisIds: this.#request.hypothesisId !== undefined ? [this.#request.hypothesisId] : [],
     };
     this.#emit({ type: 'action_planned', action });

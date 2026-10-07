@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { z } from 'zod';
-import { createEvidenceId, type InvestigationEvent, type Signal } from '@devpilot/core';
+import { createEvidenceId, type InvestigationEvent, type PlannerActionType, type Signal } from '@devpilot/core';
 import type { Planner, PlannerContext, PlannerDecision } from '@devpilot/planners';
 import { InMemoryToolRegistry, type Tool } from '@devpilot/tools';
 import { InvestigationEngine, replayInvestigation } from '../src/index.js';
@@ -16,8 +16,9 @@ const signal: Signal = {
   receivedAt: '2026-01-01T00:00:00.000Z',
 };
 
+/** A fake registered under a real planner action type, so scripted planners can request it. */
 const lookupTool: Tool<{ term: string }, { hits: number }> = {
-  name: 'fake_lookup',
+  name: 'search_code',
   description: 'Returns one deterministic observation per term',
   inputSchema: z.object({ term: z.string().min(1) }),
   outputSchema: z.object({ hits: z.number().int() }),
@@ -28,12 +29,12 @@ const lookupTool: Tool<{ term: string }, { hits: number }> = {
       output: { hits: 1 },
       evidence: [
         {
-          id: createEvidenceId({ tool: 'fake_lookup', location, content: input.term }),
+          id: createEvidenceId({ tool: 'search_code', location, content: input.term }),
           kind: 'signal_excerpt',
           summary: `Signal mentions "${input.term}"`,
           content: input.term,
           location,
-          source: { tool: 'fake_lookup' },
+          source: { tool: 'search_code' },
           collectedAt: context.now(),
         },
       ],
@@ -55,11 +56,12 @@ function createEngine(planner: Planner, budget?: { maxSteps?: number; maxDuratio
   });
 }
 
-const act = (term: string, tool = 'fake_lookup'): PlannerDecision => ({
+const act = (term: string, tool: PlannerActionType = 'search_code'): PlannerDecision => ({
   type: 'act',
   tool,
   input: { term },
   rationale: `Look up ${term}`,
+  expectedEvidence: `An observation for ${term}`,
 });
 
 describe('InvestigationEngine', () => {
@@ -74,9 +76,10 @@ describe('InvestigationEngine', () => {
               id: 'hyp-1',
               statement: 'Parser receives undefined input',
               status: 'supported',
-              confidence: 0.6,
+              confidence: 0.5,
               supportingEvidenceIds: context.evidence.map((item) => item.id),
               contradictingEvidenceIds: [],
+              nextActionReason: 'One supporting observation so far',
             },
           ],
         };
@@ -103,7 +106,7 @@ describe('InvestigationEngine', () => {
     assert.equal(state.status, 'completed');
     assert.equal(state.stepCount, 2);
     assert.equal(state.evidence.length, 1);
-    assert.deepEqual(state.evidence[0]?.source, { tool: 'fake_lookup', actionId: 'action-1' });
+    assert.deepEqual(state.evidence[0]?.source, { tool: 'search_code', actionId: 'action-1' });
     assert.deepEqual(state.hypotheses[0]?.supportingEvidenceIds, [state.evidence[0]?.id]);
     assert.deepEqual(replayInvestigation(session.events), state);
   });
@@ -137,14 +140,16 @@ describe('InvestigationEngine', () => {
 
   it('records tool failures without aborting the investigation', async () => {
     const planner = scriptedPlanner((context) => {
-      if (context.actions.length === 0) return act('x', 'missing_tool');
-      if (context.actions.length === 1) return { type: 'act', tool: 'fake_lookup', input: { term: 42 }, rationale: 'Bad input' };
+      if (context.actions.length === 0) return act('x', 'list_files');
+      if (context.actions.length === 1) {
+        return { type: 'act', tool: 'search_code', input: { term: 42 }, rationale: 'Bad input', expectedEvidence: 'None' };
+      }
       return { type: 'finish', reason: 'done' };
     });
     const session = await createEngine(planner).investigate(signal);
     const failures = session.events.filter((event) => event.type === 'action_failed');
     assert.equal(failures.length, 2);
-    assert.match(failures[0]?.type === 'action_failed' ? failures[0].error : '', /Unknown tool "missing_tool"/);
+    assert.match(failures[0]?.type === 'action_failed' ? failures[0].error : '', /Unknown tool "list_files"/);
     assert.match(failures[1]?.type === 'action_failed' ? failures[1].error : '', /Invalid input/);
     assert.equal(session.state?.status, 'completed');
   });
@@ -157,9 +162,10 @@ describe('InvestigationEngine', () => {
           id: 'hyp-1',
           statement: 'Ungrounded guess',
           status: 'proposed',
-          confidence: 0.9,
+          confidence: 0.5,
           supportingEvidenceIds: ['ev-doesnotexist'],
           contradictingEvidenceIds: [],
+          nextActionReason: 'Guess',
         },
       ],
     }));
@@ -178,7 +184,7 @@ describe('InvestigationEngine', () => {
     assert.match(throwing.state?.terminalReason ?? '', /model unavailable/);
 
     const invalid = await createEngine(
-      scriptedPlanner(() => ({ type: 'act', tool: 'fake_lookup', input: { term: 'x' }, rationale: '' })),
+      scriptedPlanner(() => ({ type: 'act', tool: 'search_code', input: { term: 'x' }, rationale: '', expectedEvidence: 'x' })),
     ).investigate(signal);
     assert.equal(invalid.state?.status, 'failed');
   });

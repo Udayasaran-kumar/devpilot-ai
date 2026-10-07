@@ -8,13 +8,13 @@ proving it red-to-green in an isolated git worktree.
 
 Built for the Build, Ship, Shape: Amazon Developer Hackathon.
 
-> Status: early. Domain schemas, the event-sourced engine skeleton, planner
-> contracts, a minimal CLI, sandboxed repository tools (`read_file`,
-> `search_code`, `list_files`, `run_command`), RED/GREEN verification of
-> command results, isolated git worktrees, `apply_patch`, and a deterministic
-> RED -> PATCH -> GREEN repair workflow exist. The patch is supplied by the
-> caller; nothing generates fixes yet. The Bedrock planner, MCP server, HTTP
-> API, and web UI are not implemented yet.
+> Status: early. Domain schemas, the event-sourced engine, a minimal CLI,
+> sandboxed repository tools (`read_file`, `search_code`, `list_files`,
+> `run_command`), RED/GREEN verification of command results, isolated git
+> worktrees, `apply_patch`, a deterministic RED -> PATCH -> GREEN repair
+> workflow, and a deterministic evidence-grounded planner that proposes
+> patches (with a patch safety policy and a grounded repair report) exist. The
+> Bedrock planner, MCP server, HTTP API, and web UI are not implemented yet.
 
 ## Principles
 
@@ -42,12 +42,13 @@ apps/
   web/        React web UI (planned)
 packages/
   core/       Zod schemas: Signal, Evidence, Hypothesis, InvestigationAction,
-              VerificationResult, Report, InvestigationEvent
+              VerificationResult, PatchProposal, RepairReport, InvestigationEvent
   tools/      Tool contract and registry, RepositorySandbox, CommandPolicy, and
               the read_file, search_code, list_files, and run_command tools
-  planners/   Planner contract, PlannerDecision schema, RulePlanner placeholder
+  planners/   Planner contract, PlannerDecision schema, evidence-driven RulePlanner
   engine/     InvestigationState, reducer, InvestigationSession, InvestigationEngine,
-              RepairWorkflow
+              RepairWorkflow, patch policy and review, GroundedRepairPipeline,
+              repair report and grounding validator
   eval/       Fixture, GroundTruth, EvaluationResult, Evaluator contracts
 fixtures/     Sample repositories used by tests and evaluation
 tests/        Cross-package integration tests
@@ -244,8 +245,9 @@ created.
 
 - It means the command went from RED to GREEN because of the patch, not that
   the patch is a correct fix. A patch that edits or deletes the failing test
-  also turns the command GREEN; reviewing what the patch changes is still up
-  to a person (or, later, a policy on which paths a patch may touch).
+  also turns the command GREEN. Proposals from a planner pass the patch
+  safety policy below before they reach the workflow; `RepairWorkflow` called
+  directly does not apply that policy.
 - The worktree is checked out from `HEAD`. Tracked uncommitted changes,
   untracked files, and gitignored files in the original (other than
   `node_modules`) make the worktree differ from what the baseline tested, so
@@ -265,6 +267,208 @@ created.
 - Worktree creation and removal are serialized per repository within one
   process; concurrent repairs from separate processes are not coordinated.
   A process that crashes mid-repair leaves its worktree behind.
+
+### Evidence-grounded planning: the planner proposes, the workflow proves
+
+```
+Incident (signal)
+   -> Evidence            (read-only tools via the ToolRegistry and RepositorySandbox)
+   -> Competing hypotheses (proposed -> supported / weakened / rejected)
+   -> Evidence-grounded planner (selects one only when sufficiently supported)
+   -> Patch proposal      (typed; never applied by the planner)
+   -> Patch policy        (deterministic review; rejections are structured)
+   -> Deterministic RepairWorkflow
+   -> RED -> PATCH -> GREEN (isolated worktree)
+   -> Grounded report     (every claim cites evidence; validated)
+```
+
+Planning and execution are intentionally separated. The planner can propose a
+repair, but only the deterministic repair workflow can prove that the repair
+worked.
+
+A planner receives a deep-frozen copy of the investigation as plain data (no
+registry, sandbox, file system, or process handle) and returns one Zod-checked
+decision: `act` (only `read_file`, `search_code`, `list_files`, or
+`run_command`, each with a reason and the evidence it expects),
+`update_hypotheses`, `propose_patch`, or `finish`. Decisions are strict
+objects: there is no decision, field, or status through which a planner can
+apply a patch, write a file, or report a repair as `repaired`.
+
+**Hypotheses.** Each has a statement, status (`proposed`, `supported`,
+`weakened`, `rejected`, `selected`), supporting and contradicting evidence
+IDs, a `nextActionReason`, and a confidence the schema caps at
+`s / (s + c + 1)` over distinct supporting (`s`) and contradicting (`c`)
+evidence items. That bound is 0 without support and never reaches 1. A status
+must match its evidence, and `selected` needs at least two supporting items,
+more support than contradiction, confidence of at least 0.6, and strictly
+higher confidence than every other hypothesis. An evidence ID may appear only
+once per hypothesis, and never as both support and contradiction. The reducer
+enforces exclusive selection and refuses hypotheses that cite uncollected
+evidence.
+
+`selected` is the planner's assertion, checked only structurally. The reducer
+can confirm that the cited evidence exists and that the counts allow
+selection. It cannot confirm that an item really supports the statement. What
+selection unlocks is narrow: a proposal may be reviewed, and that review limits
+the patch to files the supporting evidence came from. Proving anything is left
+to `RepairWorkflow`.
+
+The log keeps proposals honest:
+
+- An evidence ID names one observation. Re-recording it with different
+  content or location is refused.
+- A proposal is refused as stale if evidence arrived after the hypotheses were
+  last updated, or while an action is still running.
+- An open proposal freezes the investigation. While it awaits review, only its
+  review may follow. Once accepted, only completion may follow, and a planner
+  that tries anything else ends the investigation as `failed`.
+- `replayInvestigation` schema-checks every event before reducing it, so a
+  stored log cannot assert an impossible hypothesis or proposal.
+
+**The `RulePlanner` strategy** is a pure function of what the investigation
+has observed. It names no files, symbols, or incidents:
+
+1. Run the signal's command (argv only) to reproduce the failure. Parse the
+   test output for the failing test, the first stack frame inside the
+   repository, and the actual and expected values.
+2. Read the test file. Find the failing assertion, the assertions that ran
+   before it in the same test, and the assertions in tests that passed.
+3. Search for where the asserted value is assigned, outside test files
+   (preferring files the test imports), and read that file.
+4. Generate competing hypotheses from the shape of the computation:
+   - an input is used where a value derived from it exists in the same
+     function;
+   - an input, or a value the test checked first, is itself wrong;
+   - a numeric constant used by the computation is wrong.
+5. Assess each one with findings that quote evidence:
+   - The source shows the computation.
+   - The failing test's name refers to the derived value.
+   - Substituting known values (constants, values asserted earlier) gives the
+     expected result, or a different one, which rejects the hypothesis.
+   - An earlier assertion in the same test held.
+   - A passing test asserts the same value.
+6. Select a hypothesis only if the schema's selection rules allow it, then
+   propose a one-line diff built from the file content in evidence.
+
+On the checkout fixture this proposes four hypotheses:
+
+| Hypothesis                                    | Status   | Confidence |
+| --------------------------------------------- | -------- | ---------- |
+| `tax` should use `discounted`, not `subtotal` | selected | 0.8        |
+| `subtotal` is wrong                           | weakened | 0          |
+| `discounted` is wrong                         | weakened | 0          |
+| `TAX_RATE` is wrong                           | weakened | 0          |
+
+The tests also run the planner on a different, payroll-shaped repository,
+where it proposes the analogous change. When nothing is sufficiently
+supported, it finishes without a proposal.
+
+**Patch safety policy and review.** The engine reviews every proposal before
+it can reach `RepairWorkflow`, and the reducer re-runs the same review when
+the log is replayed. The proposal is judged exactly as given and never
+rewritten; any violation rejects it with a typed code:
+
+- **Syntax:** the patch must parse with `apply_patch`'s own parser
+  (`invalid_patch`, `unsafe_path`), and its paths must equal `affectedPaths`,
+  with no path listed twice.
+- **Path policy:** names are matched case-insensitively, and non-canonical
+  paths (`./a`, `a//b`, `..`, backslashes) are refused, not normalised. The
+  patch may not touch:
+  - tests (`test_file`);
+  - test, compiler, and task-runner configuration such as `jest.config.*`,
+    `vitest.config.*`, `tsconfig*.json`, `.mocharc*`, `pytest.ini`,
+    `conftest.py`, and `Makefile` (`test_config`);
+  - package manifests and package-manager configuration (`package_manifest`);
+  - lockfiles (`lockfile`);
+  - installed or vendored dependencies (`dependency_directory`);
+  - CI and workflow files (`ci_config`);
+  - env or credential-like files (`credential_file`);
+  - `.git` or `.devpilot` (`protected_path`);
+  - anything outside the repository (`outside_repository`).
+- **Hypothesis link:** the proposal must belong to the selected hypothesis
+  (`hypothesis_not_selected`) and may not claim more confidence than it.
+- **Evidence:** it must cite supporting evidence (`missing_supporting_evidence`)
+  that was collected and that supports that hypothesis.
+- **Scope:** it may change only files the hypothesis's supporting evidence
+  was read from (`unrelated_file`), and no more of them (`too_many_files`).
+
+An accepted proposal is `awaiting_verification`, and the investigation ends.
+`GroundedRepairPipeline` then passes the patch, byte for byte, to
+`RepairWorkflow`. The workflow's expected-failure text is the failing test
+name and comparison, but only as far as the signal quotes them.
+
+The pipeline is the only path from a planner to `RepairWorkflow`: planners
+never see the workflow, a registry, or `apply_patch`. `RepairWorkflow` itself
+stays a lower-level trusted API that takes raw patch text. A repair run that
+way has no reviewed proposal, so its report fails validation.
+
+**Grounded report.** `buildRepairReport` produces a typed `RepairReport`:
+
+- the incident and the selected hypothesis with its confidence;
+- every hypothesis, with supporting and contradicting evidence;
+- the investigation actions and the proposal with its review outcome;
+- the affected files and the verification result;
+- the authoritative repair status, copied from the workflow result or
+  `not_attempted`;
+- limitations;
+- claims. Each claim cites evidence (and the actions that produced it).
+
+`validateRepairReport` refuses a report in any of these cases:
+
+- A claim cites uncollected evidence or actions that never ran.
+- An observation or finding has no verbatim quote, or its quote is absent
+  from the evidence it cites.
+- Success wording ("tests passed", "green", "fixed", "verified") appears
+  anywhere except a `verification` claim that cites the workflow's confirmed
+  GREEN evidence.
+- A claim asserts correctness: "The repair is correct" is always rejected.
+  The supported phrasing is "Repair verified against the configured
+  verification command."
+- A claim is not one that `buildRepairReport` derives from the same logs, or
+  a derived claim is missing. A quote proves only that text exists. A
+  free-text statement under a genuine quote ("`tax` should NOT use
+  `discounted`") could invert it. So claims are re-derived, never accepted as
+  written, and contradicting findings cannot be dropped.
+- Any structured field, including limitations, differs from its derivation
+  from the logs. The report is a projection of the logs, not a second source
+  of truth.
+- The repair log is not this investigation's reviewed proposal run for the
+  same incident. That covers:
+  - a different patch: the SHA-256 of the proposal's exact bytes must match
+    the workflow's;
+  - a different hypothesis or command;
+  - a result that disagrees with its own log;
+  - a log from another investigation.
+
+**Limitations of the planner:**
+
+- It understands TAP output (`node --test`) and a few JavaScript/TypeScript
+  shapes: `assert.equal`/`strictEqual`/`deepEqual`, `expect().toBe()`,
+  `test()`/`it()` blocks, and single-line `const` declarations. Anything else
+  ends the investigation without a proposal rather than a guess.
+- Repairs are limited to substituting one identifier on one line.
+- Findings are lexical: name matching and arithmetic over literal values.
+  They are not semantic understanding.
+- Confidence counts evidence items and is not calibrated.
+- Derived claims restate the rule-based analysis. The validator checks that
+  the analysis is reproducible from the logs, not that it is right.
+
+**Limitations of the patch policy (known, not solved):**
+
+- The policy judges paths, not what a line of source does. A source-only
+  patch can still make the verification command GREEN without fixing
+  anything. For example, `process.exit(0);` at the top of an imported module
+  makes `node --test` exit 0 without running a test. Review accepts such a
+  patch from a planner, and the workflow reports `repaired`. The report then
+  says the GREEN output does not show the previously failing test passing,
+  and that only the exit code was verified. A test pins this behaviour.
+  Requiring the failing test to pass by name is future work.
+- Scope is per file, not per line. Hunks are located by their content, as
+  with `git apply`, so line numbers in a hunk header cannot bound an edit.
+  Once a file is grounded by evidence, any change within it passes review.
+- Evidence IDs are content hashes, not signatures. A process that can write
+  the event log can forge tool output with valid IDs. Logs are trusted
+  records, and repository identity is not part of them.
 
 Real friction encountered while building this is recorded in
 [`HACKATHON_FRICTION_LOG.md`](HACKATHON_FRICTION_LOG.md).
@@ -286,6 +490,8 @@ core  <-  eval
      `action_failed`.
    - `update_hypotheses`: verify every cited evidence ID exists, then emit
      `hypotheses_updated`.
+   - `propose_patch`: emit `patch_proposed`, review the proposal, then emit
+     `patch_reviewed` (`patch_rejected` or `awaiting_verification`).
    - `finish`: emit `investigation_completed`.
 3. Terminal statuses are `completed`, `step_budget_exhausted`,
    `time_budget_exhausted`, and `failed`.
@@ -293,7 +499,8 @@ core  <-  eval
 Each event passes through `reduceInvestigation`, which enforces gapless
 sequence numbers and refuses events after a terminal state. Action IDs are
 unique, an action completes or fails at most once and only after it was
-planned, and evidence must name the action that produced it.
+planned (its record carries its status and resulting evidence IDs), and
+evidence must name the action that produced it.
 
 ## Getting started
 

@@ -48,7 +48,7 @@ const verification = (
 
 const planned = (id: string, tool: string, input: JsonObject): Payload => ({
   type: 'action_planned',
-  action: { id, tool, input, rationale: tool, hypothesisIds: [] },
+  action: { id, tool, input, rationale: tool, expectedEvidence: tool, hypothesisIds: [] },
 });
 const completed = (actionId: string, item: Evidence): Payload => ({ type: 'action_completed', actionId, output: {}, evidence: [item] });
 
@@ -128,7 +128,15 @@ describe('repair events', () => {
       ['verified', 'ev-red', 'ev-red-worktree', 'ev-patch', 'ev-green'],
     );
     assert.deepEqual(state.repair?.changedFiles, ['src/a.ts']);
-    assert.deepEqual(state.finishedActionIds, ['action-1', 'action-2', 'action-3', 'action-4']);
+    assert.deepEqual(
+      state.actions.map((action) => [action.id, action.status]),
+      [
+        ['action-1', 'completed'],
+        ['action-2', 'completed'],
+        ['action-3', 'completed'],
+        ['action-4', 'completed'],
+      ],
+    );
   });
 
   it('records a failed repair and its reason', () => {

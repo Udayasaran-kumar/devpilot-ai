@@ -1,6 +1,18 @@
 import { createHash } from 'node:crypto';
-import { formatCommandLine, type Evidence, type InvestigationAction, type InvestigationEvent, type VerificationResult } from '@devpilot/core';
+import { isDeepStrictEqual } from 'node:util';
+import {
+  checkExclusiveSelection,
+  findDanglingEvidenceIds,
+  formatCommandLine,
+  InvestigationEventSchema,
+  type Evidence,
+  type InvestigationAction,
+  type InvestigationActionRecord,
+  type InvestigationEvent,
+  type VerificationResult,
+} from '@devpilot/core';
 import { APPLY_PATCH_TOOL_NAME, RUN_COMMAND_TOOL_NAME } from '@devpilot/tools';
+import { reviewPatchProposal } from './patch-review.js';
 import { isTerminalStatus, type InvestigationState, type RepairPhase, type RepairState } from './state.js';
 
 export type InvestigationReducer = (
@@ -29,10 +41,11 @@ export const reduceInvestigation: InvestigationReducer = (state, event) => {
       stepCount: 0,
       lastSequence: 0,
       actions: [],
-      finishedActionIds: [],
       evidence: [],
       hypotheses: [],
+      assessedEvidenceCount: 0,
       verifications: [],
+      patchProposals: [],
     };
   }
 
@@ -53,13 +66,19 @@ export const reduceInvestigation: InvestigationReducer = (state, event) => {
     throw new InvestigationStateError(`Cannot apply ${event.type} to a ${state.status} investigation`);
   }
 
+  requireNoOpenProposal(state, event.type);
+
   const next = { ...state, lastSequence: event.sequence };
   switch (event.type) {
     case 'action_planned':
       if (state.actions.some((action) => action.id === event.action.id)) {
         throw new InvestigationStateError(`Action ${event.action.id} has already been planned`);
       }
-      return { ...next, stepCount: state.stepCount + 1, actions: [...state.actions, event.action] };
+      return {
+        ...next,
+        stepCount: state.stepCount + 1,
+        actions: [...state.actions, { ...event.action, status: 'planned', resultingEvidenceIds: [] }],
+      };
     case 'action_completed': {
       requireUnfinishedAction(state, event.actionId);
       const misattributed = event.evidence.find((item) => (item.source.actionId ?? event.actionId) !== event.actionId);
@@ -68,21 +87,78 @@ export const reduceInvestigation: InvestigationReducer = (state, event) => {
           `Evidence ${misattributed.id} names action ${misattributed.source.actionId}, not ${event.actionId}`,
         );
       }
+      for (const item of event.evidence) {
+        const existing = state.evidence.find((known) => known.id === item.id);
+        if (existing && !sameObservation(existing, item)) {
+          throw new InvestigationStateError(`Evidence ${item.id} is already recorded with a different observation`);
+        }
+      }
       return {
         ...next,
-        finishedActionIds: [...state.finishedActionIds, event.actionId],
+        actions: finishAction(state.actions, event.actionId, {
+          status: 'completed',
+          resultingEvidenceIds: [...new Set(event.evidence.map((item) => item.id))],
+        }),
         evidence: upsertById(state.evidence, event.evidence),
       };
     }
     case 'action_failed':
       requireUnfinishedAction(state, event.actionId);
-      return { ...next, finishedActionIds: [...state.finishedActionIds, event.actionId] };
-    case 'hypotheses_updated':
+      return { ...next, actions: finishAction(state.actions, event.actionId, { status: 'failed', error: event.error }) };
+    case 'hypotheses_updated': {
+      const referenced = event.hypotheses.flatMap((h) => [...h.supportingEvidenceIds, ...h.contradictingEvidenceIds]);
+      const dangling = findDanglingEvidenceIds(referenced, state.evidence);
+      if (dangling.length > 0) {
+        throw new InvestigationStateError(`Hypotheses reference unknown evidence: ${dangling.join(', ')}`);
+      }
+      const hypotheses = upsertById(state.hypotheses, event.hypotheses);
+      for (const hypothesis of hypotheses) {
+        const problem = hypothesis.status === 'selected' ? checkExclusiveSelection(hypothesis, hypotheses) : undefined;
+        if (problem) throw new InvestigationStateError(problem);
+      }
+      return { ...next, stepCount: state.stepCount + 1, hypotheses, assessedEvidenceCount: state.evidence.length };
+    }
+    case 'patch_proposed': {
+      if (state.patchProposals.some((record) => record.id === event.proposalId)) {
+        throw new InvestigationStateError(`Proposal ${event.proposalId} already exists`);
+      }
+      const unassessed = state.evidence.slice(state.assessedEvidenceCount).map((item) => item.id);
+      if (unassessed.length > 0) {
+        throw new InvestigationStateError(
+          `Proposal ${event.proposalId} is stale: evidence ${unassessed.join(', ')} was collected after the hypotheses were last assessed`,
+        );
+      }
+      const running = state.actions.find((action) => action.status === 'planned');
+      if (running) {
+        throw new InvestigationStateError(`Proposal ${event.proposalId} cannot be made while action ${running.id} is still running`);
+      }
       return {
         ...next,
         stepCount: state.stepCount + 1,
-        hypotheses: upsertById(state.hypotheses, event.hypotheses),
+        patchProposals: [
+          ...state.patchProposals,
+          { id: event.proposalId, proposal: event.proposal, status: 'patch_proposed', violations: [] },
+        ],
       };
+    }
+    case 'patch_reviewed': {
+      const record = state.patchProposals.find((item) => item.id === event.proposalId);
+      if (record?.status !== 'patch_proposed') {
+        throw new InvestigationStateError(`patch_reviewed requires proposal ${event.proposalId} to be awaiting review`);
+      }
+      const review = reviewPatchProposal(record.proposal, state);
+      if (review.status !== event.status || !isDeepStrictEqual(review.violations, event.violations)) {
+        throw new InvestigationStateError(
+          `patch_reviewed for proposal ${event.proposalId} does not match its review (${review.status}, ${review.violations.length} violations)`,
+        );
+      }
+      return {
+        ...next,
+        patchProposals: state.patchProposals.map((item) =>
+          item.id === record.id ? { ...item, status: event.status, violations: event.violations } : item,
+        ),
+      };
+    }
     case 'verification_recorded':
       return { ...next, verifications: [...state.verifications, event.verification] };
     case 'investigation_completed':
@@ -213,13 +289,52 @@ export const reduceInvestigation: InvestigationReducer = (state, event) => {
   }
 };
 
+/**
+ * An open proposal freezes the investigation it was reviewed against: while it
+ * awaits review only its review may follow, and once accepted only completion,
+ * so no evidence or hypothesis can change under a proposal handed to the
+ * repair workflow.
+ */
+function requireNoOpenProposal(state: InvestigationState, eventType: InvestigationEvent['type']): void {
+  const open = state.patchProposals.find((record) => record.status !== 'patch_rejected');
+  if (!open) return;
+  const allowed: readonly InvestigationEvent['type'][] =
+    open.status === 'patch_proposed' ? ['patch_reviewed', 'investigation_completed'] : ['investigation_completed'];
+  if (allowed.includes(eventType)) return;
+  const waitsFor = open.status === 'patch_proposed' ? 'review' : 'verification';
+  if (eventType === 'hypotheses_updated') {
+    throw new InvestigationStateError(`Hypotheses are fixed while proposal ${open.id} awaits ${waitsFor}`);
+  }
+  throw new InvestigationStateError(
+    `Proposal ${open.id} is ${open.status}; only one proposal can be open at a time, and only ${allowed.join(' or ')} may follow it, not ${eventType}`,
+  );
+}
+
+/** Evidence IDs are content-addressed: one ID names one observation (provenance fields may differ). */
+function sameObservation(left: Evidence, right: Evidence): boolean {
+  return (
+    left.kind === right.kind &&
+    left.content === right.content &&
+    left.source.tool === right.source.tool &&
+    isDeepStrictEqual(left.location, right.location)
+  );
+}
+
 function requireUnfinishedAction(state: InvestigationState, actionId: string): void {
   if (!state.actions.some((action) => action.id === actionId)) {
     throw new InvestigationStateError(`Action ${actionId} was never planned`);
   }
-  if (state.finishedActionIds.includes(actionId)) {
+  if (state.actions.some((action) => action.id === actionId && action.status !== 'planned')) {
     throw new InvestigationStateError(`Action ${actionId} has already finished`);
   }
+}
+
+function finishAction(
+  actions: readonly InvestigationActionRecord[],
+  actionId: string,
+  outcome: Partial<Pick<InvestigationActionRecord, 'status' | 'resultingEvidenceIds' | 'error'>>,
+): InvestigationActionRecord[] {
+  return actions.map((action) => (action.id === actionId ? { ...action, ...outcome } : action));
 }
 
 function requireRepairPhase(state: InvestigationState, eventType: string, phase: RepairPhase): RepairState {
@@ -338,13 +453,22 @@ function sha256(text: string): string {
   return createHash('sha256').update(text).digest('hex');
 }
 
+/**
+ * Rebuilds state from a log. Each event is schema-checked first, because the
+ * reducer relies on schema rules (hypothesis confidence caps and status
+ * requirements, strict proposals) that a stored or hand-written log may break.
+ */
 export function replayInvestigation(
   events: Iterable<InvestigationEvent>,
   reducer: InvestigationReducer = reduceInvestigation,
 ): InvestigationState {
   let state: InvestigationState | undefined;
   for (const event of events) {
-    state = reducer(state, event);
+    const parsed = InvestigationEventSchema.safeParse(event);
+    if (!parsed.success) {
+      throw new InvestigationStateError(`Malformed ${event.type ?? 'event'} at sequence ${event.sequence}: ${parsed.error.issues.map((issue) => `${issue.path.join('.')}: ${issue.message}`).join('; ')}`);
+    }
+    state = reducer(state, parsed.data);
   }
   if (state === undefined) {
     throw new InvestigationStateError('Cannot replay an empty event log');

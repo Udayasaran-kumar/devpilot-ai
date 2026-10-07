@@ -75,6 +75,7 @@ describe('core schemas accept valid objects', () => {
       tool: 'read_file',
       input: { path: 'src/math.ts', range: [10, 12] },
       rationale: 'Inspect the function named in the stack trace',
+      expectedEvidence: 'The source of the function named in the stack trace',
       hypothesisIds: [],
     };
     assert.deepEqual(InvestigationActionSchema.parse(action), action);
@@ -206,10 +207,11 @@ describe('hypotheses reference evidence IDs', () => {
   const hypothesis: Hypothesis = {
     id: 'hyp-1',
     statement: 'add() uses the wrong operator',
-    status: 'supported',
-    confidence: 0.7,
+    status: 'weakened',
+    confidence: 0.33,
     supportingEvidenceIds: [supporting.id],
     contradictingEvidenceIds: [contradicting.id],
+    nextActionReason: 'Contradicted by a passing run',
   };
 
   it('accepts evidence ID references', () => {

@@ -145,6 +145,7 @@ describe('sandboxed verification of the sample repository', () => {
             tool: 'run_command',
             input: { command: 'npm', args: ['test'] },
             rationale: 'Reproduce the reported failure',
+            expectedEvidence: 'Failing command output',
           }),
         },
       ]),

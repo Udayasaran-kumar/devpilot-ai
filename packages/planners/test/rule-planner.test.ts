@@ -17,7 +17,8 @@ const context: PlannerContext = {
   evidence: [],
   hypotheses: [],
   verifications: [],
-  tools: [{ name: 'search', description: 'Search the repository' }],
+  patchProposals: [],
+  tools: [{ name: 'search_code', description: 'Search the repository' }],
 };
 
 describe('RulePlanner', () => {
@@ -32,11 +33,23 @@ describe('RulePlanner', () => {
       {
         name: 'search-first',
         matches: (ctx) => ctx.actions.length === 0,
-        decide: () => ({ type: 'act', tool: 'search', input: { query: 'x' }, rationale: 'Start broad' }),
+        decide: () => ({
+          type: 'act',
+          tool: 'search_code',
+          input: { query: 'x' },
+          rationale: 'Start broad',
+          expectedEvidence: 'Search hits',
+        }),
       },
       { name: 'fallback', matches: () => true, decide: () => ({ type: 'finish', reason: 'fallback' }) },
     ];
     const decision = await new RulePlanner(rules).next(context);
-    assert.deepEqual(decision, { type: 'act', tool: 'search', input: { query: 'x' }, rationale: 'Start broad' });
+    assert.deepEqual(decision, {
+      type: 'act',
+      tool: 'search_code',
+      input: { query: 'x' },
+      rationale: 'Start broad',
+      expectedEvidence: 'Search hits',
+    });
   });
 });

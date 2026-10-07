@@ -31,6 +31,11 @@ export async function invokeTool(
   if (!input.success) {
     return { ok: false, error: `Invalid input for tool "${tool.name}": ${z.prettifyError(input.error)}` };
   }
+  const parsed = input.data as Record<string, unknown>;
+  const unknown = Object.keys(action.input).filter((key) => action.input[key] !== undefined && !(key in parsed));
+  if (unknown.length > 0) {
+    return { ok: false, error: `Invalid input for tool "${tool.name}": unknown field(s) ${unknown.join(', ')}` };
+  }
 
   let result: z.infer<typeof ToolResultSchema>;
   try {

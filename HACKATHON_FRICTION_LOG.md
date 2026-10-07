@@ -84,3 +84,41 @@ Environment: macOS, Node.js 22.17.0, npm 11.6.2, TypeScript 7.0.2, tsx 4.23.
   `/usr/bin/git: exited with code 69: You have not agreed to the Xcode license
   agreements...`). A test puts a fake shim with the same behaviour ahead of a
   working git on PATH.
+
+## Test runner timings make identical runs produce different evidence
+
+- **What happened:** `node --test` prints `duration_ms` for every test and for
+  the whole run. Two runs of the planner on the same repository therefore
+  captured different `npm test` output. Because evidence IDs are
+  content-addressed, every ID cited downstream also changed, and a
+  byte-for-byte determinism test failed even though the actions, hypotheses,
+  and proposal were identical.
+- **Workaround:** the determinism tests mask the durations and compare
+  evidence IDs by order of first appearance. A separate check compares the
+  planner's decisions on an identical context. Evidence IDs are still
+  computed from the raw output; nothing in the product normalises it.
+
+## Zod output key order broke a JSON-string comparison
+
+- **What happened:** the reducer replays the patch review and compares its
+  result with the logged `patch_reviewed` event. Comparing with
+  `JSON.stringify` failed for an honest log: the review builds each violation
+  as `{ code, path, message }`, but parsing the event with the schema
+  reorders the keys to schema order (`code`, `message`, `path`).
+- **Workaround:** compare with `util.isDeepStrictEqual`.
+
+## `node --test` reports a file that exits early as a passing test
+
+- **What happened:** during the adversarial review, adding the single line
+  `process.exit(0);` to the top of the fixture's source module made
+  `npm test` exit 0. The output was `ok 1 - test/checkout.test.ts`,
+  `# tests 1`, `# pass 1`: the runner counted the whole test file as one
+  passing test, even though none of its tests ran.
+- **Impact:** a verification that trusts only the exit code (and the
+  pass/fail counts) can be turned GREEN by a source-only change, without
+  touching a test file, test configuration, or `package.json`. A path-based
+  patch policy cannot see this.
+- **Workaround:** none in the policy yet. The grounded report checks whether
+  the GREEN output names the previously failing test as passing. If not, it
+  adds a limitation saying only the exit code was verified. A regression test
+  pins the behaviour.

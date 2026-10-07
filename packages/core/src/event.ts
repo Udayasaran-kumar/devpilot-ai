@@ -4,6 +4,7 @@ import { InvestigationActionSchema } from './action.js';
 import { EvidenceIdSchema, EvidenceSchema } from './evidence.js';
 import { HypothesisSchema } from './hypothesis.js';
 import { PatchFileChangeSchema } from './patch.js';
+import { PatchProposalSchema, PatchReviewStatusSchema, PatchViolationSchema } from './proposal.js';
 import { RepairFailureStatusSchema } from './repair.js';
 import { SignalSchema } from './signal.js';
 import { VerificationResultSchema } from './verification.js';
@@ -76,6 +77,28 @@ export const InvestigationCompletedEventSchema = z.object({
   reason: z.string().min(1),
 });
 
+/** A planner proposed a patch. Recorded before review; nothing is applied. */
+export const PatchProposedEventSchema = z.object({
+  ...eventBase,
+  type: z.literal('patch_proposed'),
+  proposalId: IdSchema,
+  proposal: PatchProposalSchema,
+});
+
+/** Deterministic review of a proposal: refused, or accepted and awaiting the repair workflow. */
+export const PatchReviewedEventSchema = z
+  .object({
+    ...eventBase,
+    type: z.literal('patch_reviewed'),
+    proposalId: IdSchema,
+    status: PatchReviewStatusSchema,
+    violations: z.array(PatchViolationSchema),
+  })
+  .refine((event) => (event.status === 'patch_rejected') === event.violations.length > 0, {
+    message: 'A review has violations exactly when it rejects the proposal',
+    path: ['violations'],
+  });
+
 export const RepairStartedEventSchema = z.object({
   ...eventBase,
   type: z.literal('repair_started'),
@@ -146,6 +169,8 @@ export const InvestigationEventSchema = z.discriminatedUnion('type', [
   HypothesesUpdatedEventSchema,
   VerificationRecordedEventSchema,
   InvestigationCompletedEventSchema,
+  PatchProposedEventSchema,
+  PatchReviewedEventSchema,
   RepairStartedEventSchema,
   BaselineVerifiedEventSchema,
   WorktreeCreatedEventSchema,

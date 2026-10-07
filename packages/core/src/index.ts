@@ -11,3 +11,6 @@ export * from './command.js';
 export * from './command-verification.js';
 export * from './patch.js';
 export * from './repair.js';
+export * from './proposal.js';
+export * from './repair-report.js';
+export * from './paths.js';

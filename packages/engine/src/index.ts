@@ -4,3 +4,7 @@ export * from './session.js';
 export * from './engine.js';
 export * from './tool-invocation.js';
 export * from './repair.js';
+export * from './patch-policy.js';
+export * from './patch-review.js';
+export * from './repair-report.js';
+export * from './grounded-repair.js';
