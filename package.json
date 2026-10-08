@@ -14,7 +14,8 @@
   ],
   "scripts": {
     "cli": "tsx apps/cli/src/index.ts",
-    "test": "node --import tsx --test \"packages/*/test/**/*.test.ts\" \"tests/**/*.test.ts\"",
+    "mcp": "tsx apps/mcp/src/index.ts",
+    "test": "node --import tsx --test \"packages/*/test/**/*.test.ts\" \"apps/*/test/**/*.test.ts\" \"tests/**/*.test.ts\"",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "check": "npm run typecheck && npm test"
   },

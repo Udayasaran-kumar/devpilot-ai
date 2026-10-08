@@ -1,14 +1,20 @@
-# @devpilot/mcp (planned)
+# @devpilot/mcp
 
-Model Context Protocol server that exposes the DevPilot AI investigation engine
-to MCP-capable clients (IDEs, coding agents).
+Self-hosted Model Context Protocol server for DevPilot AI, served over
+Streamable HTTP on `http://127.0.0.1:8788/mcp`.
 
-Planned responsibilities:
+It is a protocol adapter over `@devpilot/service`: three tools
+(`list_repositories`, `start_investigation`, `get_investigation_result`),
+each one `InvestigationService` call. It does not import the engine or tools,
+and callers cannot supply repository paths, commands, planners, or budgets.
 
-- Expose investigation entry points (submit a signal, run or resume an
-  investigation) as MCP tools.
-- Stream `InvestigationEvent`s back to the client as progress notifications.
-- Expose reports and evidence as MCP resources addressable by evidence ID.
-- Reuse `@devpilot/engine` directly; contain no investigation logic of its own.
+- `src/server.ts`: `createDevPilotMcpServer(service)`, the tools and the safe
+  error mapping.
+- `src/http.ts`: `startMcpHttpServer({ service, port, token, maxBodyBytes })`,
+  the loopback `node:http` server with path, method, Host, Origin, and bearer
+  checks in front of the SDK handler.
+- `src/index.ts`: reads `DEVPILOT_MCP_TOKEN` and `DEVPILOT_MCP_CONFIG`,
+  creates the one `InvestigationService`, and starts the server.
 
-Not implemented yet.
+Run with `npm run mcp` from the repository root; configuration and the
+security model are described in the root README under "MCP server".

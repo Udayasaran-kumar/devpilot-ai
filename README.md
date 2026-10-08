@@ -13,8 +13,9 @@ Built for the Build, Ship, Shape: Amazon Developer Hackathon.
 > `run_command`), RED/GREEN verification of command results, isolated git
 > worktrees, `apply_patch`, a deterministic RED -> PATCH -> GREEN repair
 > workflow that verifies the specific failing tests, and a deterministic evidence-grounded planner that proposes
-> patches (with a patch safety policy and a grounded repair report) exist. The
-> Bedrock planner, MCP server, HTTP API, and web UI are not implemented yet.
+> patches (with a patch safety policy and a grounded repair report) exist, with
+> a transport-free service layer and a self-hosted MCP server over it. The
+> Bedrock planner, HTTP API, and web UI are not implemented yet.
 
 ## Principles
 
@@ -38,7 +39,7 @@ Built for the Build, Ship, Shape: Amazon Developer Hackathon.
 ```
 apps/
   cli/        Command-line entry point (minimal today)
-  mcp/        MCP server (planned)
+  mcp/        Self-hosted MCP server (Streamable HTTP) over the service layer
   api/        HTTP API (planned)
   web/        React web UI (planned)
 packages/
@@ -597,8 +598,72 @@ projection: status, grounded claims, baseline failures, affected files,
 limitations, and a fixed-template summary, with no host paths, logs, or patch
 text. A report that fails grounding projects as "no verified result".
 
-Protocol adapters (a future `apps/mcp`) translate requests into service calls
+Protocol adapters such as `apps/mcp` translate requests into service calls
 and add nothing to what the service allows.
+
+### MCP server
+
+`@devpilot/mcp` is a protocol adapter over the service layer: each MCP tool is
+one `InvestigationService` call, and it never reaches the engine or tools
+directly. It is the only package that imports the MCP SDK
+(`@modelcontextprotocol/server` and `@modelcontextprotocol/node`), served
+over Streamable HTTP from plain `node:http`.
+
+| Tool                       | Input                                        | Output                                 |
+| -------------------------- | -------------------------------------------- | -------------------------------------- |
+| `list_repositories`        | `{}`                                         | `{ repositories: RepositoryView[] }`   |
+| `start_investigation`      | `{ repositoryId, signal?: { kind, title, content } }` | the queued job                |
+| `get_investigation_result` | `{ jobId }`                                  | the job and, once completed, the grounded outcome |
+
+Inputs are the service's strict Zod schemas, so repository paths, commands,
+planners, and budgets are refused as unknown fields. Results carry
+`structuredContent` plus a short text block (the spoken summary once
+grounded). A failed call returns fixed text per service error code, or
+"DevPilot could not complete the request."; exception messages never reach a
+client.
+
+Run it:
+
+```sh
+DEVPILOT_MCP_TOKEN="$(openssl rand -hex 32)" \
+DEVPILOT_MCP_CONFIG=./devpilot-mcp.json \
+npm run mcp
+```
+
+| Variable                       | Meaning                                                                 |
+| ------------------------------ | ----------------------------------------------------------------------- |
+| `DEVPILOT_MCP_TOKEN`           | Required. Clients send `Authorization: Bearer <token>`. Never printed.  |
+| `DEVPILOT_MCP_CONFIG`          | Required. Server-side repository configuration (below).                 |
+| `DEVPILOT_MCP_PORT`            | Optional, default `8788`.                                               |
+| `DEVPILOT_MCP_ALLOWED_ORIGINS` | Optional comma-separated exact origins for browser-based clients.       |
+
+The configuration file registers repositories; relative roots resolve against
+the file's directory, and each repository must be a git working tree:
+
+```json
+{
+  "repositories": [
+    {
+      "repositoryId": "sample",
+      "displayName": "Sample service",
+      "repositoryRoot": "../sample-repo",
+      "verification": { "command": "npm", "args": ["test"] }
+    }
+  ]
+}
+```
+
+The endpoint is `http://127.0.0.1:8788/mcp`; the server binds to `127.0.0.1`
+only. Every request is checked in order: the path must be `/mcp` (else 404)
+and the method `POST` (else 405); the `Host` header must be `localhost`,
+`127.0.0.1`, or `[::1]` (else 403, which blocks DNS rebinding); an `Origin`
+header, if present, must be on the allowlist exactly (else 403); the bearer
+token must match, compared as SHA-256 digests with `timingSafeEqual` (else
+401 with `WWW-Authenticate: Bearer`). Bodies over 128 KiB get 413 and
+non-JSON bodies 415. The server is stateless per request (`createMcpHandler`
+with `responseMode: "json"`) and serves both 2026-07-28 clients and 2025-era
+clients without sessions; job state lives in the one `InvestigationService`
+the process creates.
 
 ### Investigation loop
 
@@ -636,6 +701,7 @@ npm run cli
 | Command             | Description                                  |
 | ------------------- | -------------------------------------------- |
 | `npm run cli`       | Run the CLI                                  |
+| `npm run mcp`       | Run the MCP server (see [MCP server](#mcp-server)) |
 | `npm test`          | Run all tests with `node:test` via `tsx`     |
 | `npm run typecheck` | Type-check every package and test with `tsc` |
 | `npm run check`     | Typecheck, then test                         |

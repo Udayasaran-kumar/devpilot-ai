@@ -46,6 +46,12 @@ export const RepositoryViewSchema = z.strictObject({
 });
 export type RepositoryView = z.infer<typeof RepositoryViewSchema>;
 
+/** Listing repositories takes no input; any field is refused. */
+export const ListRepositoriesInputSchema = z.strictObject({});
+
+export const RepositoryListSchema = z.strictObject({ repositories: z.array(RepositoryViewSchema) });
+export type RepositoryList = z.infer<typeof RepositoryListSchema>;
+
 export const JobViewSchema = z.strictObject({
   jobId: JobIdSchema,
   repositoryId: RepositoryIdSchema,

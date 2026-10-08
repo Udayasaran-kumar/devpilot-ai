@@ -1,0 +1,22 @@
+{
+  "name": "@devpilot/mcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Self-hosted MCP server (Streamable HTTP) over the DevPilot investigation service.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "test": "node --import tsx --test \"test/**/*.test.ts\""
+  },
+  "dependencies": {
+    "@devpilot/service": "0.1.0",
+    "@modelcontextprotocol/node": "2.1.1",
+    "@modelcontextprotocol/server": "2.3.1"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "2.3.1"
+  }
+}
