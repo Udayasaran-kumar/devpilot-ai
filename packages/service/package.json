@@ -1,0 +1,19 @@
+{
+  "name": "@devpilot/service",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Transport-free orchestration over the grounded repair pipeline: repository registry, investigation jobs, and result projection.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "node --import tsx --test \"test/**/*.test.ts\""
+  },
+  "dependencies": {
+    "@devpilot/core": "0.1.0",
+    "@devpilot/engine": "0.1.0",
+    "@devpilot/tools": "0.1.0",
+    "zod": "^4.1.0"
+  }
+}

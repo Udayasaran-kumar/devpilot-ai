@@ -50,6 +50,8 @@ packages/
   engine/     InvestigationState, reducer, InvestigationSession, InvestigationEngine,
               RepairWorkflow, patch policy and review, GroundedRepairPipeline,
               repair report and grounding validator
+  service/    Transport-free orchestration: repository registry, investigation
+              jobs over GroundedRepairPipeline, grounded result projection
   eval/       Fixture, GroundTruth, EvaluationResult, Evaluator contracts
 fixtures/     Sample repositories used by tests and evaluation
 tests/        Cross-package integration tests
@@ -577,9 +579,26 @@ Real friction encountered while building this is recorded in
 Package dependencies flow one way:
 
 ```
-core  <-  tools  <-  planners  <-  engine  <-  apps/*
+core  <-  tools  <-  planners  <-  engine  <-  service  <-  apps/*
 core  <-  eval
 ```
+
+### Service layer
+
+`@devpilot/service` is transport-free orchestration: no protocol, network,
+or cloud code. Repositories are registered server-side under an opaque
+`repositoryId` with their root, allowed root, and verification command;
+callers pass only `{ repositoryId, signal?: { kind, title, content } }`
+(strict, size-bounded) and cannot supply paths, commands, planners, or
+budgets. The service builds the signal itself, runs one job per repository at
+a time through `GroundedRepairPipeline` only, removes the verification
+worktree, and re-validates the report against its logs. A client sees a
+projection: status, grounded claims, baseline failures, affected files,
+limitations, and a fixed-template summary, with no host paths, logs, or patch
+text. A report that fails grounding projects as "no verified result".
+
+Protocol adapters (a future `apps/mcp`) translate requests into service calls
+and add nothing to what the service allows.
 
 ### Investigation loop
 
