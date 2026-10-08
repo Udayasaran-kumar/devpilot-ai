@@ -15,8 +15,9 @@
   "scripts": {
     "cli": "tsx apps/cli/src/index.ts",
     "mcp": "tsx apps/mcp/src/index.ts",
+    "simulator": "tsx apps/alexa-simulator/src/server/main.ts",
     "test": "node --import tsx --test \"packages/*/test/**/*.test.ts\" \"apps/*/test/**/*.test.ts\" \"tests/**/*.test.ts\"",
-    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p apps/alexa-simulator/tsconfig.json",
     "check": "npm run typecheck && npm test"
   },
   "devDependencies": {

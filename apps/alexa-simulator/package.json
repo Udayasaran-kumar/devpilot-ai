@@ -1,0 +1,21 @@
+{
+  "name": "@devpilot/alexa-simulator",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Alexa+ style web simulation of DevPilot. The browser talks only to this app's backend, which is the MCP client.",
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/server/main.ts",
+    "test": "node --import tsx --test \"test/**/*.test.ts\""
+  },
+  "devDependencies": {
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0"
+  },
+  "dependencies": {
+    "@devpilot/voice-demo": "0.1.0",
+    "esbuild": "0.28.2",
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
+  }
+}

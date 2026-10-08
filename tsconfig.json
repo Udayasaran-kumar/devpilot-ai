@@ -19,5 +19,6 @@
     "skipLibCheck": true,
     "noEmit": true
   },
-  "include": ["apps/*/src", "apps/*/test", "packages/*/src", "packages/*/test", "tests"]
+  "include": ["apps/*/src", "apps/*/test", "packages/*/src", "packages/*/test", "tests"],
+  "exclude": ["apps/alexa-simulator"]
 }

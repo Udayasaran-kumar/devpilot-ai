@@ -665,6 +665,19 @@ with `responseMode: "json"`) and serves both 2026-07-28 clients and 2025-era
 clients without sessions; job state lives in the one `InvestigationService`
 the process creates.
 
+### Alexa+ style simulator
+
+[`apps/alexa-simulator`](apps/alexa-simulator/README.md) is a web page that
+simulates an Alexa+ style conversation with DevPilot for the hackathon demo;
+it is not an Alexa product. The browser is not an MCP client: it posts each
+utterance to the simulator's `/api/dialog`, whose backend answers with the
+voice demo's `VoiceDialog` over `DevPilotMcpClient`. The browser receives
+only the dialog's response and state, and the MCP token stays on the server.
+
+```sh
+DEVPILOT_MCP_TOKEN="<the MCP server's token>" npm run simulator
+```
+
 ### Investigation loop
 
 1. The engine emits `investigation_started` with the signal and budget.
@@ -702,6 +715,7 @@ npm run cli
 | ------------------- | -------------------------------------------- |
 | `npm run cli`       | Run the CLI                                  |
 | `npm run mcp`       | Run the MCP server (see [MCP server](#mcp-server)) |
+| `npm run simulator` | Run the Alexa+ style simulator (see [Alexa+ style simulator](#alexa-style-simulator)) |
 | `npm test`          | Run all tests with `node:test` via `tsx`     |
 | `npm run typecheck` | Type-check every package and test with `tsc` |
 | `npm run check`     | Typecheck, then test                         |
