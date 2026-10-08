@@ -1,0 +1,16 @@
+{
+  "name": "@devpilot/voice-demo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Voice-style demonstration client that talks to the DevPilot MCP server over Streamable HTTP.",
+  "type": "module",
+  "exports": {
+    ".": "./src/mcp-client.ts"
+  },
+  "scripts": {
+    "test": "node --import tsx --test \"test/**/*.test.ts\""
+  },
+  "dependencies": {
+    "@modelcontextprotocol/client": "2.3.1"
+  }
+}
