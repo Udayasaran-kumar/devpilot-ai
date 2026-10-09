@@ -261,6 +261,41 @@ describe('renderEscalationPrompt', () => {
     assert.ok(SYSTEM_PROMPT.includes('- Cite only ids of items in "evidence", at most 8 per list. Never cite one id as both supporting and contradicting.'));
   });
 
+  it('separates the symptom from causes, and shared evidence from evidence that tells hypotheses apart', () => {
+    const at = (text: string) => {
+      const position = SYSTEM_PROMPT.indexOf(text);
+      assert.ok(position >= 0, text);
+      return position;
+    };
+    const causes = [
+      '- The "signal" and the failing test output show the symptom: what failed and how. A hypothesis names a cause of that symptom, not a restatement of it.',
+      'Hypotheses that call for the same change are one cause; keep only one. A rival is a different cause only if it calls for a different change.',
+    ];
+    const citations = [
+      '- An item that every hypothesis explains equally well, such as the output of the failing command, supports each of them but does not tell them apart; still cite it as supporting wherever it supports.',
+      'Cite an item as contradicting a hypothesis only when its content conflicts with that hypothesis, such as code, documentation, or another test that states different expected behavior.',
+      'If no item tells the hypotheses apart, leave the citations as they are; never invent a contradiction to break a tie.',
+    ];
+    const positions = [
+      at('- Each hypothesis must describe a distinct possible cause'),
+      ...causes.map(at),
+      at('- For each hypothesis, cite evidence that supports it'),
+      at('The same evidence item may support one hypothesis and contradict another'),
+      ...citations.map(at),
+      at('- DevPilot scores hypotheses using their cited evidence.'),
+      at('- edit is null'),
+    ];
+    assert.deepEqual(positions, [...positions].sort((a, b) => a - b), 'each addition sits where it refines the existing rule, before the edit steps');
+    assert.ok(SYSTEM_PROMPT.includes('still cite it as supporting'), 'shared evidence still counts as support');
+    assert.ok(SYSTEM_PROMPT.includes('never invent a contradiction'), 'contradictions are never manufactured');
+  });
+
+  it('names no vocabulary of the shipping fixture', () => {
+    for (const word of ['shipping', 'threshold', 'flat', 'subtotal', '500']) {
+      assert.ok(!SYSTEM_PROMPT.toLowerCase().includes(word), word);
+    }
+  });
+
   it('shows an example whose selected hypothesis passes selection, so only its placeholder path is refused', () => {
     const at = '2026-01-01T00:00:00.000Z';
     const item = (id: string, kind: Evidence['kind'], path: string): Evidence => ({
