@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict';
 import { homedir } from 'node:os';
 import { describe, it } from 'node:test';
-import { MAX_ESCALATION_CONTENT_LENGTH, type EscalationEvidence, type EscalationRequest } from '../src/index.js';
+import { MAX_ESCALATION_CONTENT_LENGTH, ModelAssessmentSchema, type EscalationEvidence, type EscalationRequest } from '../src/index.js';
 import {
   DATA_HEADER,
   MAX_PROMPT_EVIDENCE_CHARS,
   MAX_PROMPT_ITEM_CHARS,
   renderEscalationPrompt,
+  REPLY_EXAMPLE,
   SYSTEM_PROMPT,
   type EscalationPrompt,
 } from '../src/bedrock.js';
@@ -233,5 +234,33 @@ describe('renderEscalationPrompt', () => {
     }
     assert.ok(!SYSTEM_PROMPT.includes('selectedKey'));
     assert.match(SYSTEM_PROMPT, /at least 2 supporting ids/);
+  });
+
+  it('requires both evidence lists on every hypothesis, always as arrays', () => {
+    assert.match(SYSTEM_PROMPT, /Every hypothesis must include both "supportingEvidenceIds" and "contradictingEvidenceIds"\./);
+    assert.match(SYSTEM_PROMPT, /Each is always a JSON array of evidence id strings; use \[\] when there are none\./);
+    assert.match(SYSTEM_PROMPT, /Never omit either field, and never use null, a single string, or any other type for it\./);
+  });
+
+  it('shows an example reply that the planner schema accepts, with both lists on every hypothesis', () => {
+    const lines = SYSTEM_PROMPT.split('\n');
+    const shown = lines[lines.findIndex((line) => line.startsWith('Reply with exactly one JSON object')) + 1] ?? '';
+    const example: unknown = JSON.parse(shown);
+    assert.deepEqual(example, REPLY_EXAMPLE);
+    const parsed = ModelAssessmentSchema.parse(example);
+    for (const hypothesis of parsed.hypotheses) {
+      assert.ok(Array.isArray(hypothesis.supportingEvidenceIds) && Array.isArray(hypothesis.contradictingEvidenceIds));
+    }
+    assert.ok(parsed.hypotheses.some((item) => item.supportingEvidenceIds.length === 0), 'an empty supporting list is shown as []');
+    assert.ok(parsed.hypotheses.some((item) => item.contradictingEvidenceIds.length === 0), 'an empty contradicting list is shown as []');
+    assert.equal(parsed.edit?.hypothesisKey, parsed.hypotheses[0]?.key);
+  });
+
+  it('the schema still refuses a hypothesis whose evidence list is missing, null, or a string', () => {
+    for (const value of [undefined, null, 'ev-contradicting-id']) {
+      const [first, ...rest] = REPLY_EXAMPLE.hypotheses;
+      const reply = { ...REPLY_EXAMPLE, hypotheses: [{ ...first, contradictingEvidenceIds: value }, ...rest] };
+      assert.equal(ModelAssessmentSchema.safeParse(reply).success, false, String(value));
+    }
   });
 });
