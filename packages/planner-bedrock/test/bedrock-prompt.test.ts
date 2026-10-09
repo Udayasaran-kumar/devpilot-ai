@@ -243,16 +243,42 @@ describe('renderEscalationPrompt', () => {
   });
 
   it('ties the edit path to a source file the selected hypothesis cites as support, quoted exactly', () => {
-    assert.match(SYSTEM_PROMPT, /hypothesisKey is its key\.\n/);
-    assert.ok(SYSTEM_PROMPT.includes(`The edited file must be a "source_code" item whose id is in that hypothesis's "supportingEvidenceIds". A "search_result" for the same file does not count.`));
-    assert.ok(SYSTEM_PROMPT.includes(`path is that item's location "path", copied exactly: no "./" or "<repo>/" prefix and no ":line" suffix.`));
-    assert.ok(SYSTEM_PROMPT.includes(`line and originalText are copied exactly from one [line, text] pair in that item's "lines", including leading whitespace;`));
-    assert.ok(SYSTEM_PROMPT.includes('replacementText is the complete new line, on one line.'));
+    const steps = [
+      `1. Pick the "source_code" item of the file to change: the item whose "lines" you will quote. Other items, such as a "search_result", can have the same "path"; they do not count.`,
+      `2. Copy that item's "id" exactly into the selected hypothesis's "supportingEvidenceIds", in addition to the other items that support it.`,
+      `DevPilot refuses the edit if that id is missing, even when a "search_result" for the same line is cited.`,
+      `3. hypothesisKey is that hypothesis's key. path is that item's location "path", copied exactly: no "./" or "<repo>/" prefix and no ":line" suffix.`,
+      `4. line and originalText are copied exactly from one [line, text] pair in that item's "lines", including leading whitespace;`,
+      'replacementText is the complete new line, on one line.',
+    ];
+    const positions = steps.map((step) => SYSTEM_PROMPT.indexOf(step));
+    assert.ok(positions.every((position) => position >= 0), 'every step is present');
+    assert.deepEqual(positions, [...positions].sort((a, b) => a - b), 'the steps appear in order');
     assert.ok(!SYSTEM_PROMPT.includes('path is exactly the location path'), 'the old, compressed wording is gone');
+    assert.ok(!SYSTEM_PROMPT.includes('The edited file must be a "source_code" item'), 'the single-sentence rule is replaced by the steps');
 
     const [selected] = REPLY_EXAMPLE.hypotheses;
     assert.equal(REPLY_EXAMPLE.edit.hypothesisKey, selected.key);
     assert.ok((selected.supportingEvidenceIds as readonly string[]).includes('ev-edited-source-code-id'), 'the example cites the edited file as support');
+  });
+
+  it('sends "lines" only for the source file when a search hit shares its path', () => {
+    const hit: EscalationEvidence = {
+      id: 'ev-hit',
+      kind: 'search_result',
+      summary: 'src/quote.ts:2 contains "b"',
+      location: { type: 'file', path: 'src/quote.ts', startLine: 2, endLine: 2 },
+      content: 'b',
+    };
+    const data = dataOf(renderEscalationPrompt(requestOf([hit, source('ev-src', 'src/quote.ts', 'a\nb')])));
+    const atPath = data.evidence.filter((item) => item.location.path === 'src/quote.ts');
+    assert.deepEqual(
+      atPath.map((item) => [item.id, item.kind, item.lines !== undefined]),
+      [
+        ['ev-src', 'source_code', true],
+        ['ev-hit', 'search_result', false],
+      ],
+    );
   });
 
   it('shows an example reply that the planner schema accepts, with both lists on every hypothesis', () => {
