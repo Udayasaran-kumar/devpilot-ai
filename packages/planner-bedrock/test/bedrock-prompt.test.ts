@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import { homedir } from 'node:os';
 import { describe, it } from 'node:test';
-import { MAX_ESCALATION_CONTENT_LENGTH, ModelAssessmentSchema, type EscalationEvidence, type EscalationRequest } from '../src/index.js';
+import type { Evidence } from '@devpilot/core';
+import type { PlannerContext } from '@devpilot/planners';
+import { MAX_ESCALATION_CONTENT_LENGTH, ModelAssessmentSchema, planEscalation, type EscalationEvidence, type EscalationRequest } from '../src/index.js';
 import {
   DATA_HEADER,
   MAX_PROMPT_EVIDENCE_CHARS,
@@ -240,6 +242,56 @@ describe('renderEscalationPrompt', () => {
     assert.match(SYSTEM_PROMPT, /Every hypothesis must include both "supportingEvidenceIds" and "contradictingEvidenceIds"\./);
     assert.match(SYSTEM_PROMPT, /Each is always a JSON array of evidence id strings; use \[\] when there are none\./);
     assert.match(SYSTEM_PROMPT, /Never omit either field, and never use null, a single string, or any other type for it\./);
+  });
+
+  it('asks for distinct causes cited for and against, and states the selection rule DevPilot applies', () => {
+    const rules = [
+      '- Each hypothesis must describe a distinct possible cause, not a rewording of another. Include a rival only when the evidence supports a genuinely different explanation; one hypothesis is acceptable.',
+      '- For each hypothesis, cite evidence that supports it in "supportingEvidenceIds" and evidence that weighs against it in "contradictingEvidenceIds".',
+      'The same evidence item may support one hypothesis and contradict another, but never both for the same hypothesis.',
+      '- DevPilot scores hypotheses using their cited evidence. Selection requires at least 2 supporting ids, more supporting than contradicting ids, a confidence of at least 0.6, and a strictly higher confidence than every rival.',
+      'Equal-confidence hypotheses tie, so no hypothesis is selected and its edit is refused. Do not omit or invent citations to force a selection.',
+    ];
+    const positions = rules.map((rule) => SYSTEM_PROMPT.indexOf(rule));
+    assert.ok(positions.every((position) => position >= 0), 'every rule is present');
+    assert.deepEqual(positions, [...positions].sort((a, b) => a - b), 'the rules appear in order');
+    assert.ok(positions.every((position) => position < SYSTEM_PROMPT.indexOf('- edit is null')), 'before the edit steps');
+    assert.ok(!SYSTEM_PROMPT.includes('Cite every item that supports it'), 'the instruction to cite everything for every hypothesis is gone');
+    assert.ok(!SYSTEM_PROMPT.includes('more support than every other hypothesis'), 'the inexact selection rule is gone');
+    assert.ok(SYSTEM_PROMPT.includes('- Cite only ids of items in "evidence", at most 8 per list. Never cite one id as both supporting and contradicting.'));
+  });
+
+  it('shows an example whose selected hypothesis passes selection, so only its placeholder path is refused', () => {
+    const at = '2026-01-01T00:00:00.000Z';
+    const item = (id: string, kind: Evidence['kind'], path: string): Evidence => ({
+      id,
+      kind,
+      summary: path,
+      content: 'the exact text of that line\n',
+      location: { type: 'file', path },
+      source: { tool: 'read_file', actionId: `action-${id}` },
+      collectedAt: at,
+    });
+    const context: PlannerContext = {
+      investigationId: 'inv-example',
+      signal: { id: 'sig-example', kind: 'failing_test', title: 'Example', content: 'not ok 1', command: 'npm test', receivedAt: at },
+      stepCount: 4,
+      remainingSteps: 21,
+      actions: [],
+      evidence: [
+        item('ev-edited-source-code-id', 'source_code', 'src/item.ts'),
+        item('ev-other-supporting-id', 'source_code', 'test/item.test.ts'),
+        item('ev-contradicting-id', 'source_code', 'src/other.ts'),
+      ],
+      hypotheses: [],
+      verifications: [],
+      patchProposals: [],
+      tools: [],
+    };
+    const result = planEscalation(context, structuredClone(REPLY_EXAMPLE));
+    assert.equal(result.ok, false);
+    assert.equal(!result.ok && result.stage, 'edit_path_unknown', 'every check up to and including selection passes');
+    assert.ok(!result.ok && !('selectionDiagnostics' in result));
   });
 
   it('ties the edit path to a source file the selected hypothesis cites as support, quoted exactly', () => {

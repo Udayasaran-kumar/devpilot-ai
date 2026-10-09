@@ -514,6 +514,8 @@ describe('EscalatingPlanner: selection by the confidence that cited evidence cou
     ['close but unequal: 3/0 against 2/0', [[ALL, []], [['ev-test', 'ev-run'], []]], 0.75],
     ['a contradicted rival citing as much support: 2/0 against 2/1', [[['ev-src', 'ev-run'], []], [['ev-test', 'ev-run'], ['ev-src']]], 0.66],
     ['a weak rival: 3/0 against 1/0', [[ALL, []], [['ev-test'], []]], 0.75],
+    ['the supported cause over a distinct rival the edited source contradicts: 3/0 against 2/1', [[ALL, []], [['ev-test', 'ev-run'], ['ev-src']]], 0.75],
+    ['the supported cause over a distinct rival the edited source contradicts: 3/0 against 1/1', [[ALL, []], [['ev-run'], ['ev-src']]], 0.75],
   ];
   for (const [name, counts, confidence] of selectedCases) {
     it(`selects ${name}, and reports no selection diagnostics`, async () => {

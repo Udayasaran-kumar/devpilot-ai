@@ -344,6 +344,66 @@ describe('the Bedrock model client against a local Converse runtime', () => {
     assert.equal(normalizeTimings(escalated.events), normalizeTimings(rules.events));
   });
 
+  it('selects the evidence-grounded cause over a distinct rival that the source contradicts, and repairs it', async () => {
+    const rivalRuntime = () =>
+      fakeRuntime((command) => {
+        const evidence = promptData(command).evidence;
+        const find = (kind: string, file?: string) => evidence.find((item) => item.kind === kind && (file === undefined || item.location.path === file));
+        const source = find('source_code', 'src/shipping.ts');
+        const test = find('source_code', 'test/shipping.test.ts');
+        const run = find('command_output');
+        const line = source?.lines?.find(([, text]) => text === SHIPPING_BUGGY_LINE)?.[0] ?? 0;
+        return converseOutput(
+          JSON.stringify({
+            hypotheses: [
+              { key: 'threshold-comparison', statement: SHIPPING_STATEMENT, supportingEvidenceIds: [source?.id, test?.id, run?.id], contradictingEvidenceIds: [] },
+              {
+                key: 'test-expectation',
+                statement: 'The test expects free shipping at the threshold, but the threshold order should pay the flat rate.',
+                supportingEvidenceIds: [run?.id],
+                contradictingEvidenceIds: [source?.id],
+              },
+            ],
+            edit: { hypothesisKey: 'threshold-comparison', path: 'src/shipping.ts', line, originalText: SHIPPING_BUGGY_LINE, replacementText: SHIPPING_FIXED_LINE },
+          }),
+        );
+      });
+
+    const recorded = rivalRuntime();
+    const { state } = await investigate(SHIPPING_ROOT, SHIPPING, new EscalatingPlanner({ model: new BedrockModelClient({ runtime: recorded.runtime }) }));
+    assert.equal(recorded.sends.length, 1);
+    assert.deepEqual(
+      state.hypotheses.map((item) => [item.id, item.status, item.confidence]),
+      [
+        ['hyp-model-threshold-comparison', 'selected', 0.75],
+        ['hyp-model-test-expectation', 'weakened', 0.33],
+      ],
+    );
+    assert.equal(state.patchProposals.at(-1)?.status, 'awaiting_verification');
+    assert.deepEqual(state.patchProposals.at(-1)?.proposal.affectedPaths, ['src/shipping.ts']);
+
+    const realGit = await resolveGitExecutable();
+    const fixture = await createGitRepositoryFixture(realGit, SHIPPING_ROOT);
+    const { runtime, sends } = rivalRuntime();
+    const events: EscalationEvent[] = [];
+    const run = await new GroundedRepairPipeline({
+      allowedRoot: fixture.allowedRoot,
+      git: realGit,
+      planner: new EscalatingPlanner({ model: new BedrockModelClient({ runtime }), onEvent: (event) => events.push(event) }),
+    }).run({ repositoryRoot: fixture.root, signal: SHIPPING });
+    try {
+      assert.equal(sends.length, 1);
+      assert.deepEqual(events, [{ type: 'escalated', investigationId: events[0]?.investigationId, model: 'bedrock:amazon.nova-pro-v1:0', selectedHypothesisId: 'hyp-model-threshold-comparison' }]);
+      assert.equal(run.proposal?.status, 'awaiting_verification');
+      assert.equal(run.repair?.result.status, 'repaired', run.repair?.result.reason ?? undefined);
+      assert.equal(run.grounding.valid, true);
+      assert.equal(run.report.selectedHypothesis?.id, 'hyp-model-threshold-comparison');
+    } finally {
+      await run.repair?.workspace?.remove();
+      await fixture.cleanup();
+    }
+  });
+
   it('repairs the shipping incident from the rendered prompt alone, in one request that names no host path', async () => {
     const realGit = await resolveGitExecutable();
     const fixture = await createGitRepositoryFixture(realGit, SHIPPING_ROOT);

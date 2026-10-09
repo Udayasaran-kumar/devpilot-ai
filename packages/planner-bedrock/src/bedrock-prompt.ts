@@ -1,5 +1,5 @@
 import { homedir } from 'node:os';
-import type { EvidenceKind, EvidenceLocation } from '@devpilot/core';
+import { MIN_SELECTION_CONFIDENCE, MIN_SELECTION_SUPPORT, type EvidenceKind, type EvidenceLocation } from '@devpilot/core';
 import { MAX_STATEMENT_LENGTH } from './assessment.js';
 import { MAX_ESCALATION_CONTENT_LENGTH } from './escalating-planner.js';
 import type { EscalationEvidence, EscalationRequest } from './model-client.js';
@@ -54,7 +54,11 @@ export const SYSTEM_PROMPT = [
   '- Every hypothesis must include both "supportingEvidenceIds" and "contradictingEvidenceIds". Each is always a JSON array of evidence id strings; use [] when there are none.',
   '  Never omit either field, and never use null, a single string, or any other type for it.',
   '- Cite only ids of items in "evidence", at most 8 per list. Never cite one id as both supporting and contradicting.',
-  '- DevPilot selects a hypothesis only if it cites at least 2 supporting ids, more supporting than contradicting ids, and more support than every other hypothesis. Cite every item that supports it.',
+  '- Each hypothesis must describe a distinct possible cause, not a rewording of another. Include a rival only when the evidence supports a genuinely different explanation; one hypothesis is acceptable.',
+  '- For each hypothesis, cite evidence that supports it in "supportingEvidenceIds" and evidence that weighs against it in "contradictingEvidenceIds".',
+  '  The same evidence item may support one hypothesis and contradict another, but never both for the same hypothesis.',
+  `- DevPilot scores hypotheses using their cited evidence. Selection requires at least ${MIN_SELECTION_SUPPORT} supporting ids, more supporting than contradicting ids, a confidence of at least ${MIN_SELECTION_CONFIDENCE}, and a strictly higher confidence than every rival.`,
+  '  Equal-confidence hypotheses tie, so no hypothesis is selected and its edit is refused. Do not omit or invent citations to force a selection.',
   '- edit is null, or one replaced line for the hypothesis that will be selected. Write it in this order:',
   '  1. Pick the "source_code" item of the file to change: the item whose "lines" you will quote. Other items, such as a "search_result", can have the same "path"; they do not count.',
   '  2. Copy that item\'s "id" exactly into the selected hypothesis\'s "supportingEvidenceIds", in addition to the other items that support it.',
