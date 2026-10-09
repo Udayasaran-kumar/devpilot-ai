@@ -71,7 +71,8 @@ export const REFUSAL_STAGES = [
   'missing_edit',
   'edit_hypothesis_mismatch',
   'edit_unchanged',
-  'edit_path_not_supporting_source',
+  'edit_source_not_cited',
+  'edit_path_unknown',
   'edit_line_not_read',
   'original_text_mismatch',
   'invalid_proposal',
@@ -152,7 +153,8 @@ export function planEscalation(context: PlannerContext, reply: unknown): Escalat
 
   const source = sourceEvidence(context.evidence, selected, edit.path);
   if (!source) {
-    return refuse('edit_path_not_supporting_source', `${JSON.stringify(edit.path)} is not a file read as supporting evidence for ${selected.id}.`);
+    const stage = context.evidence.some((item) => isSourceAt(item, edit.path)) ? 'edit_source_not_cited' : 'edit_path_unknown';
+    return refuse(stage, `${JSON.stringify(edit.path)} is not a file read as supporting evidence for ${selected.id}.`);
   }
   const lines = numberLines(source.content, source.startLine);
   const index = lines.findIndex((line) => line.line === edit.line);
@@ -212,12 +214,18 @@ interface SourceEvidence {
 function sourceEvidence(evidence: readonly Evidence[], selected: Hypothesis, filePath: string): SourceEvidence | undefined {
   const support = new Set(selected.supportingEvidenceIds);
   for (const item of evidence) {
-    const { location, content } = item;
-    if (support.has(item.id) && item.kind === 'source_code' && location.type === 'file' && location.path === filePath && content !== undefined) {
-      return { evidence: item, content, startLine: location.startLine ?? 1 };
+    if (support.has(item.id) && isSourceAt(item, filePath)) {
+      return { evidence: item, content: item.content, startLine: item.location.startLine ?? 1 };
     }
   }
   return undefined;
+}
+
+type FileSource = Evidence & { readonly content: string; readonly location: Extract<Evidence['location'], { type: 'file' }> };
+
+/** File content read with read_file at exactly this path; no normalization. */
+function isSourceAt(item: Evidence, filePath: string): item is FileSource {
+  return item.kind === 'source_code' && item.location.type === 'file' && item.location.path === filePath && item.content !== undefined;
 }
 
 interface SourceLine {

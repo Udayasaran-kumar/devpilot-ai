@@ -292,6 +292,57 @@ describe('the Bedrock model client against a local Converse runtime', () => {
     assert.deepEqual(escalated.state.patchProposals, []);
   });
 
+  describe('the edit path must be a read source file the selected hypothesis cites, written exactly', () => {
+    interface ShippingIds {
+      readonly src: string;
+      readonly test: string;
+      readonly run: string;
+      readonly hit: string;
+    }
+    const cases: Array<[string, (ids: ShippingIds) => { support: string[]; path: string }, 'edit_source_not_cited' | 'edit_path_unknown' | 'accepted']> = [
+      ['A: cites the search hit for src/shipping.ts, not the file read', (ids) => ({ support: [ids.test, ids.run, ids.hit], path: 'src/shipping.ts' }), 'edit_source_not_cited'],
+      ['B: cites only the test file and the test run', (ids) => ({ support: [ids.test, ids.run], path: 'src/shipping.ts' }), 'edit_source_not_cited'],
+      ['C: path written ./src/shipping.ts', (ids) => ({ support: [ids.src, ids.test, ids.run], path: './src/shipping.ts' }), 'edit_path_unknown'],
+      ['D: path written shipping.ts', (ids) => ({ support: [ids.src, ids.test, ids.run], path: 'shipping.ts' }), 'edit_path_unknown'],
+      ['E: path written <repo>/src/shipping.ts', (ids) => ({ support: [ids.src, ids.test, ids.run], path: '<repo>/src/shipping.ts' }), 'edit_path_unknown'],
+      ['F: cites the file read, path src/shipping.ts', (ids) => ({ support: [ids.src, ids.test, ids.run], path: 'src/shipping.ts' }), 'accepted'],
+    ];
+
+    for (const [name, choose, expected] of cases) {
+      it(`${name}: ${expected}`, async () => {
+        const { runtime, sends } = fakeRuntime((command) => {
+          const evidence = promptData(command).evidence;
+          const idOf = (kind: string, file?: string) => evidence.find((item) => item.kind === kind && (file === undefined || item.location.path === file))?.id ?? '';
+          const ids = { src: idOf('source_code', 'src/shipping.ts'), test: idOf('source_code', 'test/shipping.test.ts'), run: idOf('command_output'), hit: idOf('search_result') };
+          const line = evidence.find((item) => item.id === ids.src)?.lines?.find(([, text]) => text === SHIPPING_BUGGY_LINE)?.[0] ?? 0;
+          const { support, path: editPath } = choose(ids);
+          return converseOutput(
+            JSON.stringify({
+              hypotheses: [{ key: 'threshold-comparison', statement: SHIPPING_STATEMENT, supportingEvidenceIds: support, contradictingEvidenceIds: [] }],
+              edit: { hypothesisKey: 'threshold-comparison', path: editPath, line, originalText: SHIPPING_BUGGY_LINE, replacementText: SHIPPING_FIXED_LINE },
+            }),
+          );
+        });
+        const events: EscalationEvent[] = [];
+        const { state } = await investigate(SHIPPING_ROOT, SHIPPING, new EscalatingPlanner({ model: new BedrockModelClient({ runtime }), onEvent: (event) => events.push(event) }));
+
+        assert.equal(sends.length, 1);
+        if (expected === 'accepted') {
+          assert.deepEqual(events.map((event) => event.type), ['escalated']);
+          assert.equal(state.patchProposals.at(-1)?.status, 'awaiting_verification');
+          assert.deepEqual(state.patchProposals.at(-1)?.proposal.affectedPaths, ['src/shipping.ts']);
+        } else {
+          assert.deepEqual(
+            events.map((event) => event.type === 'fallback' && [event.reason, event.stage]),
+            [['invalid_output', expected]],
+          );
+          assert.deepEqual(state.patchProposals, []);
+          assert.deepEqual(state.hypotheses, [], 'the rule outcome stands');
+        }
+      });
+    }
+  });
+
   it('is never asked about an incident the rules explain', async () => {
     const { runtime, sends } = fakeRuntime(() => {
       throw new Error('unexpected model request');

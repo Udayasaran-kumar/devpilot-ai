@@ -296,19 +296,41 @@ describe('EscalatingPlanner: invalid model output leaves the rule decision uncha
       'a path outside the repository',
       with_((reply) => ({ ...reply, edit: { ...reply.edit, path: '../outside/secrets.ts' } })),
       /not a file read as supporting evidence/,
-      'edit_path_not_supporting_source',
+      'edit_path_unknown',
     ],
     [
       'a file that was never read',
       with_((reply) => ({ ...reply, edit: { ...reply.edit, path: 'src/other.ts' } })),
       /not a file read as supporting evidence/,
-      'edit_path_not_supporting_source',
+      'edit_path_unknown',
+    ],
+    [
+      'a read file named with a "./" prefix',
+      with_((reply) => ({ ...reply, edit: { ...reply.edit, path: './src/quote.ts' } })),
+      /not a file read as supporting evidence/,
+      'edit_path_unknown',
     ],
     [
       'a file seen only in a search hit',
       with_((reply) => (reply.hypotheses[0] && (reply.hypotheses[0].supportingEvidenceIds = ['ev-hit', 'ev-test', 'ev-run']), reply)),
       /not a file read as supporting evidence/,
-      'edit_path_not_supporting_source',
+      'edit_source_not_cited',
+    ],
+    [
+      'a read file the selected hypothesis does not cite',
+      with_((reply) => (reply.hypotheses[0] && (reply.hypotheses[0].supportingEvidenceIds = ['ev-test', 'ev-run']), reply)),
+      /not a file read as supporting evidence/,
+      'edit_source_not_cited',
+    ],
+    [
+      'a read file cited only by a rival hypothesis',
+      with_((reply) => {
+        if (reply.hypotheses[0]) reply.hypotheses[0].supportingEvidenceIds = ['ev-test', 'ev-run', 'ev-hit'];
+        if (reply.hypotheses[1]) Object.assign(reply.hypotheses[1], { supportingEvidenceIds: ['ev-src'], contradictingEvidenceIds: [] });
+        return reply;
+      }),
+      /not a file read as supporting evidence/,
+      'edit_source_not_cited',
     ],
     [
       'an extra top-level field carrying a raw diff',
