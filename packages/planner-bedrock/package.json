@@ -5,12 +5,14 @@
   "description": "Rules-first planner that escalates to an injected model client only when the rules form no hypotheses.",
   "type": "module",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./bedrock": "./src/bedrock.ts"
   },
   "scripts": {
     "test": "node --import tsx --test \"test/**/*.test.ts\""
   },
   "dependencies": {
+    "@aws-sdk/client-bedrock-runtime": "3.1148.0",
     "@devpilot/core": "0.1.0",
     "@devpilot/planners": "0.1.0",
     "zod": "^4.1.0"

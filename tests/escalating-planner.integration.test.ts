@@ -9,6 +9,7 @@ import { InvestigationEventSchema, type InvestigationEvent, type Signal } from '
 import { GroundedRepairPipeline, InvestigationEngine, replayInvestigation } from '@devpilot/engine';
 import { RulePlanner, type Planner } from '@devpilot/planners';
 import { EscalatingPlanner, type EscalationEvent } from '@devpilot/planner-bedrock';
+import { BedrockModelClient } from '@devpilot/planner-bedrock/bedrock';
 import { InvestigationService, RepositoryRegistry } from '@devpilot/service';
 import { createDefaultToolRegistry, RepositorySandbox, resolveGitExecutable } from '@devpilot/tools';
 import {
@@ -22,6 +23,7 @@ import {
   shippingModel,
   type LineEdit,
 } from '../packages/planner-bedrock/test/support/fake-models.js';
+import { fakeRuntime, shippingRuntime, userText } from '../packages/planner-bedrock/test/support/fake-runtime.js';
 import { createGitRepositoryFixture, git } from '../packages/tools/test/support/git-repository.js';
 
 const CHECKOUT_ROOT = fileURLToPath(new URL('../fixtures/sample-repository/', import.meta.url));
@@ -239,6 +241,45 @@ describe('InvestigationService with the escalating planner', () => {
       await shipping.cleanup();
       await checkout.cleanup();
     }
+  });
+});
+
+describe('the Bedrock model client against a local Converse runtime', () => {
+  it('repairs the shipping incident from the rendered prompt alone, in one request that names no host path', async () => {
+    const realGit = await resolveGitExecutable();
+    const fixture = await createGitRepositoryFixture(realGit, SHIPPING_ROOT);
+    const { runtime, sends } = shippingRuntime();
+    const events: EscalationEvent[] = [];
+    const run = await new GroundedRepairPipeline({
+      allowedRoot: fixture.allowedRoot,
+      git: realGit,
+      planner: new EscalatingPlanner({ model: new BedrockModelClient({ runtime }), onEvent: (event) => events.push(event) }),
+    }).run({ repositoryRoot: fixture.root, signal: SHIPPING });
+    try {
+      assert.equal(sends.length, 1);
+      assert.deepEqual(events.map((event) => event.type), ['escalated']);
+      assert.equal(run.repair?.result.status, 'repaired', run.repair?.result.reason ?? undefined);
+      assert.equal(run.grounding.valid, true);
+      assert.equal(run.report.selectedHypothesis?.id, 'hyp-model-threshold-comparison');
+
+      const request = JSON.stringify(sends[0]?.command.input);
+      for (const hostPath of [fixture.base, fixture.root, fixture.canonicalRoot, homedir(), tmpdir(), '/private/']) {
+        assert.ok(!request.includes(hostPath), `the request mentions ${hostPath}`);
+      }
+      assert.ok(userText(sends[0]!.command).includes('src/shipping.ts'));
+    } finally {
+      await run.repair?.workspace?.remove();
+      await fixture.cleanup();
+    }
+  });
+
+  it('is never asked about an incident the rules explain', async () => {
+    const { runtime, sends } = fakeRuntime(() => {
+      throw new Error('unexpected model request');
+    });
+    const { state } = await investigate(CHECKOUT_ROOT, CHECKOUT_SIGNAL, new EscalatingPlanner({ model: new BedrockModelClient({ runtime }) }));
+    assert.equal(sends.length, 0);
+    assert.equal(state.patchProposals.at(-1)?.status, 'awaiting_verification');
   });
 });
 
