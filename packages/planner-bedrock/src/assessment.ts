@@ -90,6 +90,8 @@ export type EscalationPlanResult =
       readonly reason: string;
       /** For `schema`: up to `MAX_SCHEMA_ISSUES` entries of `path: code`, built only from schema field names, indices, and Zod issue codes. */
       readonly schemaIssues?: readonly string[];
+      /** For `edit_source_not_cited` and `edit_path_unknown`: whether the selected hypothesis cites a `search_result` at exactly the edit's path. */
+      readonly citedSearchResultAtEditPath?: boolean;
     };
 
 /**
@@ -154,7 +156,10 @@ export function planEscalation(context: PlannerContext, reply: unknown): Escalat
   const source = sourceEvidence(context.evidence, selected, edit.path);
   if (!source) {
     const stage = context.evidence.some((item) => isSourceAt(item, edit.path)) ? 'edit_source_not_cited' : 'edit_path_unknown';
-    return refuse(stage, `${JSON.stringify(edit.path)} is not a file read as supporting evidence for ${selected.id}.`);
+    return {
+      ...refuse(stage, `${JSON.stringify(edit.path)} is not a file read as supporting evidence for ${selected.id}.`),
+      citedSearchResultAtEditPath: citesSearchResultAt(context.evidence, selected, edit.path),
+    };
   }
   const lines = numberLines(source.content, source.startLine);
   const index = lines.findIndex((line) => line.line === edit.line);
@@ -222,6 +227,12 @@ function sourceEvidence(evidence: readonly Evidence[], selected: Hypothesis, fil
 }
 
 type FileSource = Evidence & { readonly content: string; readonly location: Extract<Evidence['location'], { type: 'file' }> };
+
+/** A search hit at exactly this path that the selected hypothesis cites as support; no normalization. */
+function citesSearchResultAt(evidence: readonly Evidence[], selected: Hypothesis, filePath: string): boolean {
+  const support = new Set(selected.supportingEvidenceIds);
+  return evidence.some((item) => support.has(item.id) && item.kind === 'search_result' && item.location.type === 'file' && item.location.path === filePath);
+}
 
 /** File content read with read_file at exactly this path; no normalization. */
 function isSourceAt(item: Evidence, filePath: string): item is FileSource {

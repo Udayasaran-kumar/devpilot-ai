@@ -32,7 +32,11 @@ export type EscalationEvent =
       readonly stage?: RefusalStage;
       /** For a `schema` refusal: bounded `path: code` entries. Safe to log. */
       readonly schemaIssues?: readonly string[];
+      /** For an `edit_source_not_cited` or `edit_path_unknown` refusal: whether the selected hypothesis cites a search hit at exactly the edit's path. Safe to log. */
+      readonly citedSearchResultAtEditPath?: boolean;
     };
+
+type FallbackDiagnostics = Pick<Extract<EscalationEvent, { type: 'fallback' }>, 'stage' | 'schemaIssues' | 'citedSearchResultAtEditPath'>;
 
 export interface EscalatingPlannerOptions {
   readonly model: ModelClient;
@@ -112,7 +116,7 @@ export class EscalatingPlanner implements Planner {
   }
 
   async #escalate(context: PlannerContext, ruleDecision: FinishDecision): Promise<PlannerDecision> {
-    const fallback = (reason: FallbackReason, detail: string, diagnostics: { stage?: RefusalStage; schemaIssues?: readonly string[] } = {}) => {
+    const fallback = (reason: FallbackReason, detail: string, diagnostics: FallbackDiagnostics = {}) => {
       this.#onEvent?.({ type: 'fallback', investigationId: context.investigationId, reason, detail, ...diagnostics });
       return ruleDecision;
     };
@@ -138,7 +142,11 @@ export class EscalatingPlanner implements Planner {
 
     const result = planEscalation(context, outcome.reply);
     if (!result.ok) {
-      return fallback('invalid_output', result.reason, { stage: result.stage, ...(result.schemaIssues ? { schemaIssues: result.schemaIssues } : {}) });
+      return fallback('invalid_output', result.reason, {
+        stage: result.stage,
+        ...(result.schemaIssues ? { schemaIssues: result.schemaIssues } : {}),
+        ...(result.citedSearchResultAtEditPath !== undefined ? { citedSearchResultAtEditPath: result.citedSearchResultAtEditPath } : {}),
+      });
     }
     const [first] = result.plan.decisions;
     if (!first) return fallback('invalid_output', 'The plan is empty.');

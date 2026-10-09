@@ -299,16 +299,16 @@ describe('the Bedrock model client against a local Converse runtime', () => {
       readonly run: string;
       readonly hit: string;
     }
-    const cases: Array<[string, (ids: ShippingIds) => { support: string[]; path: string }, 'edit_source_not_cited' | 'edit_path_unknown' | 'accepted']> = [
-      ['A: cites the search hit for src/shipping.ts, not the file read', (ids) => ({ support: [ids.test, ids.run, ids.hit], path: 'src/shipping.ts' }), 'edit_source_not_cited'],
-      ['B: cites only the test file and the test run', (ids) => ({ support: [ids.test, ids.run], path: 'src/shipping.ts' }), 'edit_source_not_cited'],
-      ['C: path written ./src/shipping.ts', (ids) => ({ support: [ids.src, ids.test, ids.run], path: './src/shipping.ts' }), 'edit_path_unknown'],
-      ['D: path written shipping.ts', (ids) => ({ support: [ids.src, ids.test, ids.run], path: 'shipping.ts' }), 'edit_path_unknown'],
-      ['E: path written <repo>/src/shipping.ts', (ids) => ({ support: [ids.src, ids.test, ids.run], path: '<repo>/src/shipping.ts' }), 'edit_path_unknown'],
+    const cases: Array<[string, (ids: ShippingIds) => { support: string[]; path: string }, 'edit_source_not_cited' | 'edit_path_unknown' | 'accepted', boolean?]> = [
+      ['A: cites the search hit for src/shipping.ts, not the file read', (ids) => ({ support: [ids.test, ids.run, ids.hit], path: 'src/shipping.ts' }), 'edit_source_not_cited', true],
+      ['B: cites only the test file and the test run', (ids) => ({ support: [ids.test, ids.run], path: 'src/shipping.ts' }), 'edit_source_not_cited', false],
+      ['C: path written ./src/shipping.ts', (ids) => ({ support: [ids.src, ids.test, ids.run], path: './src/shipping.ts' }), 'edit_path_unknown', false],
+      ['D: path written shipping.ts', (ids) => ({ support: [ids.src, ids.test, ids.run], path: 'shipping.ts' }), 'edit_path_unknown', false],
+      ['E: path written <repo>/src/shipping.ts', (ids) => ({ support: [ids.src, ids.test, ids.run], path: '<repo>/src/shipping.ts' }), 'edit_path_unknown', false],
       ['F: cites the file read, path src/shipping.ts', (ids) => ({ support: [ids.src, ids.test, ids.run], path: 'src/shipping.ts' }), 'accepted'],
     ];
 
-    for (const [name, choose, expected] of cases) {
+    for (const [name, choose, expected, citedSearchResult] of cases) {
       it(`${name}: ${expected}`, async () => {
         const { runtime, sends } = fakeRuntime((command) => {
           const evidence = promptData(command).evidence;
@@ -333,8 +333,8 @@ describe('the Bedrock model client against a local Converse runtime', () => {
           assert.deepEqual(state.patchProposals.at(-1)?.proposal.affectedPaths, ['src/shipping.ts']);
         } else {
           assert.deepEqual(
-            events.map((event) => event.type === 'fallback' && [event.reason, event.stage]),
-            [['invalid_output', expected]],
+            events.map((event) => event.type === 'fallback' && [event.reason, event.stage, event.citedSearchResultAtEditPath]),
+            [['invalid_output', expected, citedSearchResult]],
           );
           assert.deepEqual(state.patchProposals, []);
           assert.deepEqual(state.hypotheses, [], 'the rule outcome stands');

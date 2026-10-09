@@ -407,6 +407,11 @@ describe('EscalatingPlanner: invalid model output leaves the rule decision uncha
       assert.match(event?.type === 'fallback' ? event.detail : '', detail);
       assert.equal(event?.type === 'fallback' && event.stage, stage);
       assert.equal(event?.type === 'fallback' && event.schemaIssues !== undefined, stage === 'schema', 'schema issues accompany schema refusals only');
+      assert.equal(
+        event?.type === 'fallback' && event.citedSearchResultAtEditPath !== undefined,
+        stage === 'edit_source_not_cited' || stage === 'edit_path_unknown',
+        'the search-hit diagnostic accompanies edit-path refusals only',
+      );
       assert.equal(planner.latch, undefined, 'invalid output does not disable escalation');
 
       await planner.next(contextFor());
@@ -440,6 +445,43 @@ describe('EscalatingPlanner: invalid model output leaves the rule decision uncha
     assert.ok(event.schemaIssues.includes('hypotheses.0: unrecognized_keys'));
     const { detail: _detail, ...safe } = event;
     assert.ok(!JSON.stringify(safe).includes(MARKER), 'nothing but the detail can carry reply text');
+  });
+
+  it('reports whether the selected hypothesis cites a search hit at exactly the edit path', async () => {
+    const otherHit: Evidence = {
+      id: 'ev-test-hit',
+      kind: 'search_result',
+      summary: 'Match for `quote(`',
+      content: '  assert.equal(quote(1, 1).value, 0);',
+      location: { type: 'file', path: 'test/quote.test.ts', startLine: 3, endLine: 3 },
+      source: { tool: 'search_code', actionId: 'action-5' },
+      collectedAt: AT,
+    };
+    const replyWith = (supportingEvidenceIds: string[], edit: Partial<NonNullable<ModelAssessment['edit']>> = {}) => {
+      const [selected, ...rest] = VALID_REPLY.hypotheses;
+      return { hypotheses: [{ ...selected, supportingEvidenceIds }, ...rest], edit: { ...VALID_REPLY.edit, ...edit } };
+    };
+    const cases: Array<[string, object, RefusalStage, boolean | undefined]> = [
+      ['a matching-path search hit is cited instead of the file', replyWith(['ev-hit', 'ev-test', 'ev-run']), 'edit_source_not_cited', true],
+      ['a matching-path search hit exists but is not cited', replyWith(['ev-test', 'ev-run']), 'edit_source_not_cited', false],
+      ['a search hit for another file is cited', replyWith(['ev-test-hit', 'ev-test', 'ev-run']), 'edit_source_not_cited', false],
+      ['the hit is cited but the path is written "./src/quote.ts"', replyWith(['ev-hit', 'ev-test', 'ev-run'], { path: './src/quote.ts' }), 'edit_path_unknown', false],
+      ['the file is cited, but the original text is wrong', replyWith(['ev-src', 'ev-test', 'ev-run'], { originalText: '  x;' }), 'original_text_mismatch', undefined],
+      ['the hit and the file are cited, but the line was not read', replyWith(['ev-src', 'ev-hit', 'ev-run'], { line: 40 }), 'edit_line_not_read', undefined],
+    ];
+    for (const [name, reply, stage, cited] of cases) {
+      const { planner, events } = setup(reply);
+      assert.deepEqual(await planner.next(contextFor('inv-1', { evidence: [...EVIDENCE, otherHit] })), RULE_FINISH, name);
+      const [event] = events;
+      assert.ok(event?.type === 'fallback', name);
+      assert.equal(event.stage, stage, name);
+      assert.equal(event.citedSearchResultAtEditPath, cited, name);
+      assert.equal('citedSearchResultAtEditPath' in event, cited !== undefined, `${name}: present only for edit-path refusals`);
+    }
+
+    const { planner, events } = setup(VALID_REPLY);
+    await planner.next(contextFor('inv-1', { evidence: [...EVIDENCE, otherHit] }));
+    assert.deepEqual(events.map((event) => event.type), ['escalated'], 'an accepted reply reports no diagnostic');
   });
 
   it('reports a non-object reply as a root type issue', async () => {

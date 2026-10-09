@@ -56,11 +56,13 @@ if (!model) {
   console.log(`model: ${NOVA_PRO_MODEL_ID}`);
   console.log(`region: ${config?.region}`);
   console.log(`modelRequests: ${sends}`);
-  // Never print `detail`: it may quote the model reply. `stage` and `schemaIssues` are fixed vocabulary.
+  // Never print `detail`: it may quote the model reply. `stage`, `schemaIssues`, and `citedSearchResultAtEditPath` are fixed vocabulary.
   const describe = (event: EscalationEvent) =>
     event.type === 'escalated'
       ? 'escalated'
-      : `fallback (${event.reason}${event.stage ? ` at ${event.stage}` : ''}${event.schemaIssues?.length ? `; schema: ${event.schemaIssues.join(', ')}` : ''})`;
+      : `fallback (${event.reason}${event.stage ? ` at ${event.stage}` : ''}${event.schemaIssues?.length ? `; schema: ${event.schemaIssues.join(', ')}` : ''}${
+          event.citedSearchResultAtEditPath !== undefined ? `; citedSearchResultAtEditPath: ${event.citedSearchResultAtEditPath}` : ''
+        })`;
   console.log(`escalation: ${events.map(describe).join(', ') || 'none'}`);
   console.log(`proposal: ${run?.proposal?.status ?? 'none passed review'}`);
   console.log(`repair: ${run?.repair?.result.status ?? 'not attempted'}`);
