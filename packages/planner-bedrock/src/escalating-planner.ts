@@ -1,5 +1,5 @@
 import { RulePlanner, type Planner, type PlannerContext, type PlannerDecision } from '@devpilot/planners';
-import { planEscalation, type EscalationPlan } from './assessment.js';
+import { planEscalation, type EscalationPlan, type RefusalStage } from './assessment.js';
 import { ModelUnavailableError, type EscalationRequest, type ModelClient } from './model-client.js';
 
 export const DEFAULT_MODEL_TIMEOUT_MS = 30_000;
@@ -22,7 +22,17 @@ export type FallbackReason =
 
 export type EscalationEvent =
   | { readonly type: 'escalated'; readonly investigationId: string; readonly model: string; readonly selectedHypothesisId: string }
-  | { readonly type: 'fallback'; readonly investigationId: string; readonly reason: FallbackReason; readonly detail: string };
+  | {
+      readonly type: 'fallback';
+      readonly investigationId: string;
+      readonly reason: FallbackReason;
+      /** May quote the model reply; never show it to end users. */
+      readonly detail: string;
+      /** For `invalid_output`: the check that refused the reply. Safe to log. */
+      readonly stage?: RefusalStage;
+      /** For a `schema` refusal: bounded `path: code` entries. Safe to log. */
+      readonly schemaIssues?: readonly string[];
+    };
 
 export interface EscalatingPlannerOptions {
   readonly model: ModelClient;
@@ -102,8 +112,8 @@ export class EscalatingPlanner implements Planner {
   }
 
   async #escalate(context: PlannerContext, ruleDecision: FinishDecision): Promise<PlannerDecision> {
-    const fallback = (reason: FallbackReason, detail: string) => {
-      this.#onEvent?.({ type: 'fallback', investigationId: context.investigationId, reason, detail });
+    const fallback = (reason: FallbackReason, detail: string, diagnostics: { stage?: RefusalStage; schemaIssues?: readonly string[] } = {}) => {
+      this.#onEvent?.({ type: 'fallback', investigationId: context.investigationId, reason, detail, ...diagnostics });
       return ruleDecision;
     };
     if (this.#latch) return fallback('latched', `Escalation is disabled for this process (${this.#latch}).`);
@@ -127,7 +137,9 @@ export class EscalatingPlanner implements Planner {
     }
 
     const result = planEscalation(context, outcome.reply);
-    if (!result.ok) return fallback('invalid_output', result.reason);
+    if (!result.ok) {
+      return fallback('invalid_output', result.reason, { stage: result.stage, ...(result.schemaIssues ? { schemaIssues: result.schemaIssues } : {}) });
+    }
     const [first] = result.plan.decisions;
     if (!first) return fallback('invalid_output', 'The plan is empty.');
 

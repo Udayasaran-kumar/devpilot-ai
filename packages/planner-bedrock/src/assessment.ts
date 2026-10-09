@@ -59,9 +59,37 @@ export interface EscalationPlan {
   readonly selectedHypothesisId: string;
 }
 
+/** The check that refused a reply, in the order `planEscalation` applies them. Fixed names that carry no model text. */
+export const REFUSAL_STAGES = [
+  'schema',
+  'duplicate_key',
+  'unknown_evidence',
+  'invalid_hypothesis',
+  'no_supported_hypothesis',
+  'below_selection_threshold',
+  'no_exclusive_winner',
+  'missing_edit',
+  'edit_hypothesis_mismatch',
+  'edit_unchanged',
+  'edit_path_not_supporting_source',
+  'edit_line_not_read',
+  'original_text_mismatch',
+  'invalid_proposal',
+] as const;
+export type RefusalStage = (typeof REFUSAL_STAGES)[number];
+
+export const MAX_SCHEMA_ISSUES = 5;
+
 export type EscalationPlanResult =
   | { readonly ok: true; readonly plan: EscalationPlan }
-  | { readonly ok: false; readonly reason: string };
+  | {
+      readonly ok: false;
+      readonly stage: RefusalStage;
+      /** May quote the reply (keys, IDs, paths); for host diagnostics only. */
+      readonly reason: string;
+      /** For `schema`: up to `MAX_SCHEMA_ISSUES` entries of `path: code`, built only from schema field names, indices, and Zod issue codes. */
+      readonly schemaIssues?: readonly string[];
+    };
 
 /**
  * Validates a model reply against the investigation and, only if every check
@@ -71,17 +99,22 @@ export type EscalationPlanResult =
  */
 export function planEscalation(context: PlannerContext, reply: unknown): EscalationPlanResult {
   const parsed = ModelAssessmentSchema.safeParse(reply);
-  if (!parsed.success) return refuse(`The model reply does not match the assessment schema: ${z.prettifyError(parsed.error)}`);
+  if (!parsed.success) {
+    return {
+      ...refuse('schema', `The model reply does not match the assessment schema: ${z.prettifyError(parsed.error)}`),
+      schemaIssues: parsed.error.issues.slice(0, MAX_SCHEMA_ISSUES).map(describeIssue),
+    };
+  }
   const assessment = parsed.data;
 
   const keys = assessment.hypotheses.map((draft) => draft.key);
   const repeated = keys.filter((key, index) => keys.indexOf(key) !== index);
-  if (repeated.length > 0) return refuse(`The model reply repeats hypothesis keys: ${unique(repeated).join(', ')}`);
+  if (repeated.length > 0) return refuse('duplicate_key', `The model reply repeats hypothesis keys: ${unique(repeated).join(', ')}`);
 
   const known = new Set(context.evidence.map((item) => item.id));
   const cited = assessment.hypotheses.flatMap((draft) => [...draft.supportingEvidenceIds, ...draft.contradictingEvidenceIds]);
   const unknown = unique(cited.filter((id) => !known.has(id)));
-  if (unknown.length > 0) return refuse(`The model reply cites evidence that was never collected: ${unknown.join(', ')}`);
+  if (unknown.length > 0) return refuse('unknown_evidence', `The model reply cites evidence that was never collected: ${unknown.join(', ')}`);
 
   const proposed: Hypothesis[] = [];
   const assessed: Hypothesis[] = [];
@@ -101,36 +134,36 @@ export function planEscalation(context: PlannerContext, reply: unknown): Escalat
     ];
     for (const candidate of candidates) {
       const checked = HypothesisSchema.safeParse(candidate);
-      if (!checked.success) return refuse(`Hypothesis ${id} is invalid: ${z.prettifyError(checked.error)}`);
+      if (!checked.success) return refuse('invalid_hypothesis', `Hypothesis ${id} is invalid: ${z.prettifyError(checked.error)}`);
     }
     proposed.push(candidates[0] as Hypothesis);
     assessed.push(candidates[1] as Hypothesis);
   }
 
   const selected = chooseHypothesis(assessed);
-  if (!selected) return refuse('No model hypothesis is supported well enough by the cited evidence to be selected.');
+  if (!selected) return refuse(selectionFailure(assessed), 'No model hypothesis is supported well enough by the cited evidence to be selected.');
 
   const { edit } = assessment;
-  if (!edit) return refuse(`The model proposed no edit for ${selected.id}.`);
+  if (!edit) return refuse('missing_edit', `The model proposed no edit for ${selected.id}.`);
   if (`${MODEL_HYPOTHESIS_PREFIX}${edit.hypothesisKey}` !== selected.id) {
-    return refuse(`The edit is for ${MODEL_HYPOTHESIS_PREFIX}${edit.hypothesisKey}, but the evidence selects ${selected.id}.`);
+    return refuse('edit_hypothesis_mismatch', `The edit is for ${MODEL_HYPOTHESIS_PREFIX}${edit.hypothesisKey}, but the evidence selects ${selected.id}.`);
   }
-  if (edit.replacementText === edit.originalText) return refuse('The edit does not change the line.');
+  if (edit.replacementText === edit.originalText) return refuse('edit_unchanged', 'The edit does not change the line.');
 
   const source = sourceEvidence(context.evidence, selected, edit.path);
   if (!source) {
-    return refuse(`${JSON.stringify(edit.path)} is not a file read as supporting evidence for ${selected.id}.`);
+    return refuse('edit_path_not_supporting_source', `${JSON.stringify(edit.path)} is not a file read as supporting evidence for ${selected.id}.`);
   }
   const lines = numberLines(source.content, source.startLine);
   const index = lines.findIndex((line) => line.line === edit.line);
   const original = lines[index];
-  if (!original) return refuse(`Line ${edit.line} is not among the lines of ${edit.path} in evidence ${source.evidence.id}.`);
+  if (!original) return refuse('edit_line_not_read', `Line ${edit.line} is not among the lines of ${edit.path} in evidence ${source.evidence.id}.`);
   if (original.text !== edit.originalText) {
-    return refuse(`Line ${edit.line} of ${edit.path} in evidence ${source.evidence.id} is not the original text the model quoted.`);
+    return refuse('original_text_mismatch', `Line ${edit.line} of ${edit.path} in evidence ${source.evidence.id} is not the original text the model quoted.`);
   }
 
   const proposal = PatchProposalSchema.safeParse(buildProposal(context, selected, edit.path, lines, index, edit.replacementText));
-  if (!proposal.success) return refuse(`The patch proposal is invalid: ${z.prettifyError(proposal.error)}`);
+  if (!proposal.success) return refuse('invalid_proposal', `The patch proposal is invalid: ${z.prettifyError(proposal.error)}`);
 
   const decisions: PlannerDecision[] = [
     { type: 'update_hypotheses', hypotheses: proposed },
@@ -242,8 +275,26 @@ function buildProposal(
   };
 }
 
-function refuse(reason: string): EscalationPlanResult {
-  return { ok: false, reason };
+function refuse(stage: RefusalStage, reason: string) {
+  return { ok: false, stage, reason } as const;
+}
+
+/**
+ * Why `chooseHypothesis` selected nothing, following its order: no supported
+ * hypothesis, the best one below the selection requirements, or a rival at
+ * least as confident.
+ */
+function selectionFailure(assessed: readonly Hypothesis[]): RefusalStage {
+  const supported = assessed.filter((item) => item.status === 'supported');
+  const best = supported.reduce<Hypothesis | undefined>((top, item) => (top === undefined || item.confidence > top.confidence ? item : top), undefined);
+  if (!best) return 'no_supported_hypothesis';
+  return HypothesisSchema.safeParse({ ...best, status: 'selected' }).success ? 'no_exclusive_winner' : 'below_selection_threshold';
+}
+
+/** `path: code`, where only schema field names and array indices are kept from the path; anything else becomes `?`. */
+function describeIssue(issue: z.core.$ZodIssue): string {
+  const path = issue.path.map((part) => (typeof part === 'number' || (typeof part === 'string' && /^[A-Za-z]{1,40}$/.test(part)) ? String(part) : '?')).join('.');
+  return `${path || '(root)'}: ${issue.code}`;
 }
 
 function unique<T>(items: readonly T[]): T[] {

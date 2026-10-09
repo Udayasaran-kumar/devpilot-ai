@@ -23,7 +23,7 @@ import {
   shippingModel,
   type LineEdit,
 } from '../packages/planner-bedrock/test/support/fake-models.js';
-import { fakeRuntime, shippingRuntime, userText } from '../packages/planner-bedrock/test/support/fake-runtime.js';
+import { converseOutput, fakeRuntime, promptData, shippingRuntime, userText } from '../packages/planner-bedrock/test/support/fake-runtime.js';
 import { createGitRepositoryFixture, git } from '../packages/tools/test/support/git-repository.js';
 
 const CHECKOUT_ROOT = fileURLToPath(new URL('../fixtures/sample-repository/', import.meta.url));
@@ -271,6 +271,25 @@ describe('the Bedrock model client against a local Converse runtime', () => {
       await run.repair?.workspace?.remove();
       await fixture.cleanup();
     }
+  });
+
+  it('a reply the planner refuses reports only its stage and leaves the rule outcome exactly as without the model', async () => {
+    const { runtime, sends } = fakeRuntime((command) => {
+      const ids = promptData(command).evidence.map((item) => item.id);
+      const hypothesis = (key: string) => ({ key, statement: `Hypothesis ${key}.`, supportingEvidenceIds: ids.slice(0, 3), contradictingEvidenceIds: [] });
+      return converseOutput(JSON.stringify({ hypotheses: [hypothesis('first'), hypothesis('second')], edit: null }));
+    });
+    const events: EscalationEvent[] = [];
+    const rules = await investigate(SHIPPING_ROOT, SHIPPING, new RulePlanner());
+    const escalated = await investigate(SHIPPING_ROOT, SHIPPING, new EscalatingPlanner({ model: new BedrockModelClient({ runtime }), onEvent: (event) => events.push(event) }));
+
+    assert.equal(sends.length, 1);
+    assert.deepEqual(
+      events.map((event) => event.type === 'fallback' && [event.reason, event.stage]),
+      [['invalid_output', 'no_exclusive_winner']],
+    );
+    assert.equal(normalizeTimings(escalated.events), normalizeTimings(rules.events));
+    assert.deepEqual(escalated.state.patchProposals, []);
   });
 
   it('is never asked about an incident the rules explain', async () => {

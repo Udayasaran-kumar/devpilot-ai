@@ -56,7 +56,12 @@ if (!model) {
   console.log(`model: ${NOVA_PRO_MODEL_ID}`);
   console.log(`region: ${config?.region}`);
   console.log(`modelRequests: ${sends}`);
-  console.log(`escalation: ${events.map((event) => (event.type === 'escalated' ? 'escalated' : `fallback (${event.reason})`)).join(', ') || 'none'}`);
+  // Never print `detail`: it may quote the model reply. `stage` and `schemaIssues` are fixed vocabulary.
+  const describe = (event: EscalationEvent) =>
+    event.type === 'escalated'
+      ? 'escalated'
+      : `fallback (${event.reason}${event.stage ? ` at ${event.stage}` : ''}${event.schemaIssues?.length ? `; schema: ${event.schemaIssues.join(', ')}` : ''})`;
+  console.log(`escalation: ${events.map(describe).join(', ') || 'none'}`);
   console.log(`proposal: ${run?.proposal?.status ?? 'none passed review'}`);
   console.log(`repair: ${run?.repair?.result.status ?? 'not attempted'}`);
   console.log(`groundingValid: ${run?.grounding.valid}`);
