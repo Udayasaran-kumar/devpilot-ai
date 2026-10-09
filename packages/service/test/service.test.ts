@@ -9,6 +9,7 @@ import { GroundedRepairPipeline, type GroundedRepairRun } from '@devpilot/engine
 import { resolveGitExecutable, type GitExecutable } from '@devpilot/tools';
 import {
   createGitRepositoryFixture,
+  git,
   type GitRepositoryFixture,
 } from '../../tools/test/support/git-repository.js';
 import {
@@ -20,6 +21,7 @@ import {
   retainReport,
   ServiceError,
   type InvestigationResult,
+  type InvestigationServiceOptions,
   type JobView,
   type ServiceErrorCode,
   type SignalInput,
@@ -270,6 +272,38 @@ describe('InvestigationService runs the grounded repair pipeline', () => {
     assertNoHostPaths(failing.getResult({ jobId: job.jobId }), [...hostPaths, missing]);
     const retry = failing.startInvestigation({ repositoryId: 'gone', signal: FAILURE });
     await failing.waitForJob({ jobId: retry.jobId });
+  });
+});
+
+describe('InvestigationService with an injected planner', () => {
+  it('plans every job with the injected planner instead of the default rules', async () => {
+    const realGit = await resolveGitExecutable();
+    const shop = await createGitRepositoryFixture(realGit);
+    try {
+      const registry = new RepositoryRegistry();
+      registry.register({ repositoryId: 'shop', displayName: 'Shop', repositoryRoot: shop.root, allowedRoot: shop.allowedRoot, verification: NPM_TEST });
+      const seen: Array<{ investigationId: string; signal: Signal; evidence: number }> = [];
+      const planner: NonNullable<InvestigationServiceOptions['planner']> = {
+        name: 'recording',
+        next: async (context) => {
+          seen.push({ investigationId: context.investigationId, signal: context.signal, evidence: context.evidence.length });
+          return { type: 'finish', reason: 'The injected planner stops before collecting evidence.' };
+        },
+      };
+      const service = new InvestigationService({ registry, git: realGit, planner });
+      const job = service.startInvestigation({ repositoryId: 'shop', signal: FAILURE });
+      assert.equal((await service.waitForJob({ jobId: job.jobId })).status, 'completed');
+
+      assert.equal(seen.length, 1, 'the injected planner made the only planning decision');
+      assert.equal(seen[0]?.evidence, 0);
+      assert.equal(seen[0]?.signal.content, FAILURE.content);
+      assert.deepEqual(seen[0]?.signal.metadata, { repositoryId: 'shop' });
+      const outcome = service.getResult({ jobId: job.jobId }).outcome;
+      assert.equal(outcome?.repairStatus, 'not_attempted', 'the rule planner would have repaired this incident');
+      assert.equal(git(realGit, shop.root, 'status', '--porcelain'), '');
+    } finally {
+      await shop.cleanup();
+    }
   });
 });
 

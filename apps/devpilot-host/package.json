@@ -1,0 +1,21 @@
+{
+  "name": "@devpilot/host",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Composition root: the investigation service with the rules-first, model-escalation planner, served by the DevPilot MCP server.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "node --import tsx --test \"test/**/*.test.ts\""
+  },
+  "dependencies": {
+    "@devpilot/mcp": "0.1.0",
+    "@devpilot/planner-bedrock": "0.1.0",
+    "@devpilot/service": "0.1.0"
+  },
+  "devDependencies": {
+    "@devpilot/voice-demo": "0.1.0"
+  }
+}

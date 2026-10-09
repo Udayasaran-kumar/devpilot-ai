@@ -1,19 +1,30 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { cp, mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { readFile } from 'node:fs/promises';
+import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, it } from 'node:test';
 import { InvestigationEventSchema, type InvestigationEvent, type Signal } from '@devpilot/core';
 import { GroundedRepairPipeline, InvestigationEngine, replayInvestigation } from '@devpilot/engine';
 import { RulePlanner, type Planner } from '@devpilot/planners';
-import { EscalatingPlanner, type EscalationEvent, type EscalationRequest, type ModelClient } from '@devpilot/planner-bedrock';
+import { EscalatingPlanner, type EscalationEvent } from '@devpilot/planner-bedrock';
+import { InvestigationService, RepositoryRegistry } from '@devpilot/service';
 import { createDefaultToolRegistry, RepositorySandbox, resolveGitExecutable } from '@devpilot/tools';
-import { git } from '../packages/tools/test/support/git-repository.js';
+import {
+  countingModel,
+  SHIPPING_BUGGY_LINE,
+  SHIPPING_EDIT,
+  SHIPPING_FIXED_LINE,
+  SHIPPING_ROOT,
+  SHIPPING_SIGNAL,
+  SHIPPING_STATEMENT,
+  shippingModel,
+  type LineEdit,
+} from '../packages/planner-bedrock/test/support/fake-models.js';
+import { createGitRepositoryFixture, git } from '../packages/tools/test/support/git-repository.js';
 
 const CHECKOUT_ROOT = fileURLToPath(new URL('../fixtures/sample-repository/', import.meta.url));
-const SHIPPING_ROOT = fileURLToPath(new URL('../fixtures/shipping-repository/', import.meta.url));
 const START = Date.parse('2026-01-01T00:00:00.000Z');
 
 const CHECKOUT_SIGNAL: Signal = {
@@ -25,17 +36,7 @@ const CHECKOUT_SIGNAL: Signal = {
   receivedAt: '2026-01-01T00:00:00.000Z',
 };
 
-const SHIPPING_SIGNAL: Signal = {
-  id: 'sig-shipping-threshold',
-  kind: 'failing_test',
-  title: 'Orders exactly at the free-shipping threshold are charged shipping',
-  content: 'not ok 3 - ships free exactly at the threshold\n    500 !== 0',
-  command: 'npm test',
-  receivedAt: '2026-01-01T00:00:00.000Z',
-};
-
-const BUGGY_LINE = '  const shipping = subtotal > freeThreshold ? 0 : flatRate;';
-const FIXED_LINE = '  const shipping = subtotal >= freeThreshold ? 0 : flatRate;';
+const SHIPPING: Signal = { ...SHIPPING_SIGNAL, id: 'sig-shipping-threshold', command: 'npm test', receivedAt: '2026-01-01T00:00:00.000Z' };
 
 const sha256 = (text: string) => createHash('sha256').update(text).digest('hex');
 
@@ -67,73 +68,13 @@ function normalizeTimings(events: readonly InvestigationEvent[]): string {
     });
 }
 
-interface Edit {
-  readonly path: string;
-  readonly originalText: string;
-  readonly replacementText: string;
-}
-
-const SHIPPING_EDIT: Edit = { path: 'src/shipping.ts', originalText: BUGGY_LINE, replacementText: FIXED_LINE };
-
-/**
- * Stands in for a model on the shipping incident. Evidence IDs are content
- * addressed and vary between runs, so it reads them from the request, as a
- * model would, and answers with the given edit.
- */
-function shippingModel(edit: Edit = SHIPPING_EDIT) {
-  const requests: EscalationRequest[] = [];
-  const client: ModelClient = {
-    name: 'fake-shipping-model',
-    assess: async (request) => {
-      requests.push(request);
-      const idOf = (kind: string, file?: string) =>
-        request.evidence.find((item) => item.kind === kind && (file === undefined || (item.location.type === 'file' && item.location.path === file)))?.id;
-      const source = idOf('source_code', 'src/shipping.ts');
-      const test = idOf('source_code', 'test/shipping.test.ts');
-      const run = idOf('command_output');
-      const edited = request.evidence.find((item) => item.id === (edit.path === 'src/shipping.ts' ? source : test));
-      const line = (edited?.content ?? '').split('\n').indexOf(edit.originalText) + 1;
-      return {
-        hypotheses: [
-          {
-            key: 'threshold-comparison',
-            statement: 'The free-shipping check uses > where the documented rule is "at or above", so an order exactly at the threshold pays shipping.',
-            supportingEvidenceIds: [source, test, run],
-            contradictingEvidenceIds: [],
-          },
-          {
-            key: 'flat-rate',
-            statement: 'The caller passes the wrong flat rate.',
-            supportingEvidenceIds: [],
-            contradictingEvidenceIds: [test],
-          },
-        ],
-        edit: { hypothesisKey: 'threshold-comparison', line, ...edit },
-      };
-    },
-  };
-  return { client, requests };
-}
-
-const countingModel = () => {
-  const counter = { calls: 0 };
-  const client: ModelClient = {
-    name: 'counting-model',
-    assess: async () => {
-      counter.calls += 1;
-      throw new Error('must not be called');
-    },
-  };
-  return { client, counter };
-};
-
 describe('rules-first, model-escalation planner on real repositories', () => {
   it('the rules alone cannot explain the shipping incident', async () => {
-    const { state } = await investigate(SHIPPING_ROOT, SHIPPING_SIGNAL, new RulePlanner());
+    const { state } = await investigate(SHIPPING_ROOT, SHIPPING, new RulePlanner());
     assert.equal(state.status, 'completed');
     assert.deepEqual(state.hypotheses, []);
     assert.deepEqual(state.patchProposals, []);
-    assert.equal(state.terminalReason, `No competing hypotheses could be formed from \`${BUGGY_LINE.trim()}\`.`);
+    assert.equal(state.terminalReason, `No competing hypotheses could be formed from \`${SHIPPING_BUGGY_LINE.trim()}\`.`);
   });
 
   it('a rule-solvable incident makes zero model calls and produces exactly the rule planner event log', async () => {
@@ -155,7 +96,7 @@ describe('rules-first, model-escalation planner on real repositories', () => {
     const model = shippingModel();
     const events: EscalationEvent[] = [];
     const planner = new EscalatingPlanner({ model: model.client, onEvent: (event) => events.push(event) });
-    const { events: log, state } = await investigate(SHIPPING_ROOT, SHIPPING_SIGNAL, planner);
+    const { events: log, state } = await investigate(SHIPPING_ROOT, SHIPPING, planner);
 
     assert.equal(model.requests.length, 1);
     assert.match(model.requests[0]?.ruleConclusion ?? '', /^No competing hypotheses could be formed/);
@@ -178,30 +119,22 @@ describe('rules-first, model-escalation planner on real repositories', () => {
     assert.equal(record?.status, 'awaiting_verification');
     assert.deepEqual(record?.violations, []);
     assert.deepEqual(record?.proposal.affectedPaths, ['src/shipping.ts']);
-    assert.match(record?.proposal.patch ?? '', new RegExp(`^-${escape(BUGGY_LINE)}\\n\\+${escape(FIXED_LINE)}$`, 'm'));
+    assert.match(record?.proposal.patch ?? '', new RegExp(`^-${escape(SHIPPING_BUGGY_LINE)}\\n\\+${escape(SHIPPING_FIXED_LINE)}$`, 'm'));
     assert.equal(record?.proposal.expectedOutcome, 'If the hypothesis holds, `npm test` exits 0 and "ships free exactly at the threshold" no longer fails.');
   });
 
   it('only the repair workflow proves the model-assisted proposal RED -> PATCH -> GREEN, in a worktree', async () => {
     const realGit = await resolveGitExecutable();
-    const base = await mkdtemp(path.join(tmpdir(), 'devpilot-escalation-'));
-    const allowedRoot = path.join(base, 'allowed');
-    const root = path.join(allowedRoot, 'shipping');
-    await mkdir(allowedRoot);
-    await cp(SHIPPING_ROOT, root, { recursive: true });
-    git(realGit, root, 'init', '-q', '-b', 'main');
-    git(realGit, root, 'add', '-A');
-    git(realGit, root, 'commit', '-q', '-m', 'Initial commit');
-
+    const fixture = await createGitRepositoryFixture(realGit, SHIPPING_ROOT);
     const model = shippingModel();
     let tick = START;
     const run = await new GroundedRepairPipeline({
-      allowedRoot,
+      allowedRoot: fixture.allowedRoot,
       git: realGit,
       planner: new EscalatingPlanner({ model: model.client }),
       clock: () => (tick += 1000),
       generateId: (purpose) => `${purpose}-shipping`,
-    }).run({ repositoryRoot: root, signal: SHIPPING_SIGNAL });
+    }).run({ repositoryRoot: fixture.root, signal: SHIPPING });
     try {
       assert.equal(model.requests.length, 1);
       assert.equal(run.proposal?.status, 'awaiting_verification');
@@ -213,20 +146,20 @@ describe('rules-first, model-escalation planner on real repositories', () => {
       assert.deepEqual(repair.result.changedFiles, ['src/shipping.ts']);
       assert.deepEqual(repair.state.repair?.expectedFailure, ['ships free exactly at the threshold', '500 !== 0']);
       assert.equal(repair.result.originalUnchanged, true);
-      assert.ok((await readFile(path.join(root, 'src/shipping.ts'), 'utf8')).includes(BUGGY_LINE), 'the original repository is unchanged');
-      assert.ok((await readFile(path.join(repair.workspace?.getSandbox().root ?? '', 'src/shipping.ts'), 'utf8')).includes(FIXED_LINE));
+      assert.ok((await readFile(path.join(fixture.root, 'src/shipping.ts'), 'utf8')).includes(SHIPPING_BUGGY_LINE), 'the original repository is unchanged');
+      assert.ok((await readFile(path.join(repair.workspace?.getSandbox().root ?? '', 'src/shipping.ts'), 'utf8')).includes(SHIPPING_FIXED_LINE));
       assert.deepEqual(run.grounding.issues, []);
       assert.equal(run.grounding.valid, true);
       assert.equal(run.report.selectedHypothesis?.id, 'hyp-model-threshold-comparison');
       assert.equal(run.report.confidence, 0.75);
     } finally {
       await run.repair?.workspace?.remove();
-      await rm(base, { recursive: true, force: true });
+      await fixture.cleanup();
     }
   });
 
   it('a model edit to the failing test passes the local checks but is refused by the existing review', async () => {
-    const edit: Edit = {
+    const edit: LineEdit = {
       path: 'test/shipping.test.ts',
       originalText: '  assert.equal(quote.shipping, 0);',
       replacementText: '  assert.equal(quote.shipping, 500);',
@@ -234,7 +167,7 @@ describe('rules-first, model-escalation planner on real repositories', () => {
     const testSource = await readFile(path.join(SHIPPING_ROOT, edit.path), 'utf8');
     assert.ok(testSource.split('\n').includes(edit.originalText), 'the fixture contains the line being edited');
     const model = shippingModel(edit);
-    const { state } = await investigate(SHIPPING_ROOT, SHIPPING_SIGNAL, new EscalatingPlanner({ model: model.client }));
+    const { state } = await investigate(SHIPPING_ROOT, SHIPPING, new EscalatingPlanner({ model: model.client }));
 
     const record = state.patchProposals.at(-1);
     assert.equal(record?.status, 'patch_rejected');
@@ -244,10 +177,10 @@ describe('rules-first, model-escalation planner on real repositories', () => {
   });
 
   it('an invalid model reply leaves the rule outcome exactly as if the model had never been asked', async () => {
-    const model = shippingModel({ ...SHIPPING_EDIT, originalText: '  const shipping = subtotal >= freeThreshold ? 0 : flatRate;' });
+    const model = shippingModel({ ...SHIPPING_EDIT, originalText: SHIPPING_FIXED_LINE });
     const events: EscalationEvent[] = [];
-    const rules = await investigate(SHIPPING_ROOT, SHIPPING_SIGNAL, new RulePlanner());
-    const escalated = await investigate(SHIPPING_ROOT, SHIPPING_SIGNAL, new EscalatingPlanner({ model: model.client, onEvent: (event) => events.push(event) }));
+    const rules = await investigate(SHIPPING_ROOT, SHIPPING, new RulePlanner());
+    const escalated = await investigate(SHIPPING_ROOT, SHIPPING, new EscalatingPlanner({ model: model.client, onEvent: (event) => events.push(event) }));
 
     assert.equal(model.requests.length, 1);
     assert.deepEqual(
@@ -257,6 +190,55 @@ describe('rules-first, model-escalation planner on real repositories', () => {
     assert.equal(normalizeTimings(escalated.events), normalizeTimings(rules.events));
     assert.deepEqual(escalated.state.hypotheses, []);
     assert.deepEqual(escalated.state.patchProposals, []);
+  });
+});
+
+describe('InvestigationService with the escalating planner', () => {
+  it('repairs the shipping incident through the service, asks the model only for it, and projects no model text', async () => {
+    const realGit = await resolveGitExecutable();
+    const shipping = await createGitRepositoryFixture(realGit, SHIPPING_ROOT);
+    const checkout = await createGitRepositoryFixture(realGit);
+    try {
+      const registry = new RepositoryRegistry();
+      const npmTest = { command: 'npm', args: ['test'] };
+      registry.register({ repositoryId: 'shipping', displayName: 'Shipping', repositoryRoot: shipping.root, allowedRoot: shipping.allowedRoot, verification: npmTest });
+      registry.register({ repositoryId: 'checkout', displayName: 'Checkout', repositoryRoot: checkout.root, allowedRoot: checkout.allowedRoot, verification: npmTest });
+      const model = shippingModel();
+      const planner = new EscalatingPlanner({ model: model.client });
+      const service = new InvestigationService({ registry, git: realGit, planner });
+
+      const checkoutJob = service.startInvestigation({ repositoryId: 'checkout', signal: { kind: 'failing_test', title: CHECKOUT_SIGNAL.title, content: CHECKOUT_SIGNAL.content } });
+      const shippingJob = service.startInvestigation({ repositoryId: 'shipping', signal: SHIPPING_SIGNAL });
+      assert.equal((await service.waitForJob({ jobId: checkoutJob.jobId })).status, 'completed');
+      assert.equal((await service.waitForJob({ jobId: shippingJob.jobId })).status, 'completed');
+
+      assert.equal(model.requests.length, 1, 'only the incident the rules cannot explain reaches the model');
+      assert.equal(planner.modelCalls, 1);
+      const checkoutOutcome = service.getResult({ jobId: checkoutJob.jobId }).outcome;
+      assert.equal(checkoutOutcome?.repairStatus, 'repaired');
+      assert.ok(!JSON.stringify(checkoutOutcome).includes('hyp-model-'));
+
+      const result = service.getResult({ jobId: shippingJob.jobId });
+      const outcome = result.outcome;
+      assert.ok(outcome);
+      assert.equal(outcome.groundingValid, true);
+      assert.equal(outcome.repairStatus, 'repaired');
+      assert.deepEqual(outcome.baselineFailures.map((failure) => failure.testName), ['ships free exactly at the threshold']);
+      assert.deepEqual(outcome.affectedFiles, ['src/shipping.ts']);
+      assert.ok(outcome.claims.some((claim) => claim.kind === 'verification'));
+      assert.ok(outcome.claims.some((claim) => claim.kind === 'proposal' && claim.statement.includes('hyp-model-threshold-comparison')));
+      assert.match(outcome.spokenSummary, /verified a patch in an isolated worktree/);
+
+      const text = JSON.stringify(result);
+      assert.ok(!text.includes(SHIPPING_STATEMENT) && !text.includes('at or above'), 'model-written hypothesis text is not projected');
+      assert.ok(!text.includes('@@ '), 'no diff hunks');
+      for (const hostPath of [shipping.base, shipping.root, shipping.canonicalRoot, homedir(), tmpdir()]) assert.ok(!text.includes(hostPath));
+      assert.equal(git(realGit, shipping.root, 'status', '--porcelain'), '');
+      assert.ok((await readFile(path.join(shipping.root, 'src/shipping.ts'), 'utf8')).includes(SHIPPING_BUGGY_LINE));
+    } finally {
+      await shipping.cleanup();
+      await checkout.cleanup();
+    }
   });
 });
 

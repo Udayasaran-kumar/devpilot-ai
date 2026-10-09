@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { realpath } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { formatCommandLine, SignalSchema, type Signal } from '@devpilot/core';
-import { GroundedRepairPipeline } from '@devpilot/engine';
+import { GroundedRepairPipeline, type GroundedRepairOptions } from '@devpilot/engine';
 import type { GitExecutable, HostEnvironment } from '@devpilot/tools';
 import {
   InvestigationResultSchema,
@@ -27,6 +27,8 @@ export interface InvestigationServiceOptions {
   readonly registry: RepositoryRegistry;
   readonly git?: GitExecutable;
   readonly hostEnvironment?: HostEnvironment;
+  /** Plans every job's investigation, including concurrent ones. Defaults to the pipeline's `RulePlanner`. */
+  readonly planner?: GroundedRepairOptions['planner'];
   /** Epoch milliseconds. */
   readonly clock?: () => number;
 }
@@ -128,12 +130,13 @@ export class InvestigationService {
       await Promise.resolve();
       job.status = 'running';
       job.hostPaths = await hostPathsOf(repository);
-      const { git, hostEnvironment } = this.#options;
+      const { git, hostEnvironment, planner } = this.#options;
       const pipeline = new GroundedRepairPipeline({
         allowedRoot: repository.allowedRoot,
         clock: this.#clock,
         ...(git ? { git } : {}),
         ...(hostEnvironment ? { hostEnvironment } : {}),
+        ...(planner ? { planner } : {}),
       });
       const run = await pipeline.run({ repositoryRoot: repository.repositoryRoot, signal });
       const workspace = run.repair?.workspace;

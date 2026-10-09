@@ -40,15 +40,15 @@ export function git(executable: GitExecutable, cwd: string, ...args: string[]): 
   );
 }
 
-/** `allowed/repo`: a copy of the sample repository committed on `main`, plus an empty `outside` directory. */
-export async function createGitRepositoryFixture(executable: GitExecutable): Promise<GitRepositoryFixture> {
+/** `allowed/repo`: a copy of `source` (the sample repository by default) committed on `main`, plus an empty `outside` directory. */
+export async function createGitRepositoryFixture(executable: GitExecutable, source: string = FIXTURE_ROOT): Promise<GitRepositoryFixture> {
   const base = await mkdtemp(path.join(tmpdir(), 'devpilot-worktree-'));
   const allowedRoot = path.join(base, 'allowed');
   const root = path.join(allowedRoot, 'repo');
   const outside = path.join(base, 'outside');
   await mkdir(allowedRoot);
   await mkdir(outside);
-  await cp(FIXTURE_ROOT, root, { recursive: true });
+  await cp(source, root, { recursive: true });
   git(executable, root, 'init', '-q', '-b', 'main');
   git(executable, root, 'add', '-A');
   git(executable, root, 'commit', '-q', '-m', 'Initial commit');
