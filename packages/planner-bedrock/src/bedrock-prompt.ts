@@ -20,7 +20,7 @@ export const REPLY_EXAMPLE = {
     {
       key: 'hypothesis-key',
       statement: 'One sentence explaining the failure.',
-      supportingEvidenceIds: ['ev-first-supporting-id', 'ev-second-supporting-id'],
+      supportingEvidenceIds: ['ev-edited-source-code-id', 'ev-other-supporting-id'],
       contradictingEvidenceIds: [],
     },
     {
@@ -55,8 +55,9 @@ export const SYSTEM_PROMPT = [
   '  Never omit either field, and never use null, a single string, or any other type for it.',
   '- Cite only ids of items in "evidence", at most 8 per list. Never cite one id as both supporting and contradicting.',
   '- DevPilot selects a hypothesis only if it cites at least 2 supporting ids, more supporting than contradicting ids, and more support than every other hypothesis. Cite every item that supports it.',
-  '- edit is null, or one replaced line for the hypothesis that will be selected: hypothesisKey is its key;',
-  '  path is exactly the location path of a "source_code" item that this hypothesis cites as supporting;',
+  '- edit is null, or one replaced line for the hypothesis that will be selected: hypothesisKey is its key.',
+  '  The edited file must be a "source_code" item whose id is in that hypothesis\'s "supportingEvidenceIds". A "search_result" for the same file does not count.',
+  '  path is that item\'s location "path", copied exactly: no "./" or "<repo>/" prefix and no ":line" suffix.',
   '  line and originalText are copied exactly from one [line, text] pair in that item\'s "lines", including leading whitespace;',
   '  replacementText is the complete new line, on one line.',
   '- Never include confidence, status, commands, diffs, or any other field.',

@@ -242,6 +242,19 @@ describe('renderEscalationPrompt', () => {
     assert.match(SYSTEM_PROMPT, /Never omit either field, and never use null, a single string, or any other type for it\./);
   });
 
+  it('ties the edit path to a source file the selected hypothesis cites as support, quoted exactly', () => {
+    assert.match(SYSTEM_PROMPT, /hypothesisKey is its key\.\n/);
+    assert.ok(SYSTEM_PROMPT.includes(`The edited file must be a "source_code" item whose id is in that hypothesis's "supportingEvidenceIds". A "search_result" for the same file does not count.`));
+    assert.ok(SYSTEM_PROMPT.includes(`path is that item's location "path", copied exactly: no "./" or "<repo>/" prefix and no ":line" suffix.`));
+    assert.ok(SYSTEM_PROMPT.includes(`line and originalText are copied exactly from one [line, text] pair in that item's "lines", including leading whitespace;`));
+    assert.ok(SYSTEM_PROMPT.includes('replacementText is the complete new line, on one line.'));
+    assert.ok(!SYSTEM_PROMPT.includes('path is exactly the location path'), 'the old, compressed wording is gone');
+
+    const [selected] = REPLY_EXAMPLE.hypotheses;
+    assert.equal(REPLY_EXAMPLE.edit.hypothesisKey, selected.key);
+    assert.ok((selected.supportingEvidenceIds as readonly string[]).includes('ev-edited-source-code-id'), 'the example cites the edited file as support');
+  });
+
   it('shows an example reply that the planner schema accepts, with both lists on every hypothesis', () => {
     const lines = SYSTEM_PROMPT.split('\n');
     const shown = lines[lines.findIndex((line) => line.startsWith('Reply with exactly one JSON object')) + 1] ?? '';
