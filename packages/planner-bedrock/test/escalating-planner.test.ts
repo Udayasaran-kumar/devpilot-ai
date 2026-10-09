@@ -412,6 +412,9 @@ describe('EscalatingPlanner: invalid model output leaves the rule decision uncha
         stage === 'edit_source_not_cited' || stage === 'edit_path_unknown',
         'the search-hit diagnostic accompanies edit-path refusals only',
       );
+      const selectionStage = stage === 'no_supported_hypothesis' || stage === 'below_selection_threshold' || stage === 'no_exclusive_winner';
+      assert.equal(event?.type === 'fallback' && 'selectionDiagnostics' in event, selectionStage, 'selection diagnostics accompany selection refusals only');
+      assert.equal(event?.type === 'fallback' && 'editPresent' in event, selectionStage, 'editPresent accompanies selection refusals only');
       assert.equal(planner.latch, undefined, 'invalid output does not disable escalation');
 
       await planner.next(contextFor());
@@ -488,6 +491,107 @@ describe('EscalatingPlanner: invalid model output leaves the rule decision uncha
     const { planner, events } = setup('plain text');
     await planner.next(contextFor());
     assert.deepEqual(events[0]?.type === 'fallback' && events[0].schemaIssues, ['(root): invalid_type']);
+  });
+});
+
+describe('EscalatingPlanner: selection by the confidence that cited evidence counts allow', () => {
+  type Counts = readonly [supporting: readonly string[], contradicting: readonly string[]];
+  const ALL = ['ev-src', 'ev-test', 'ev-run'];
+  /** The first hypothesis is the one the edit is for. */
+  const replyOf = (counts: readonly Counts[], edit: ModelAssessment['edit'] = VALID_REPLY.edit) => ({
+    hypotheses: counts.map(([supportingEvidenceIds, contradictingEvidenceIds], index) => ({
+      key: index === 0 ? 'boundary' : `rival-${index}`,
+      statement: `Hypothesis ${index}.`,
+      supportingEvidenceIds: [...supportingEvidenceIds],
+      contradictingEvidenceIds: [...contradictingEvidenceIds],
+    })),
+    edit,
+  });
+  const diagnostic = (supportingCount: number, contradictingCount: number, computedConfidence: number) => ({ supportingCount, contradictingCount, computedConfidence });
+
+  const selectedCases: Array<[string, readonly Counts[], number]> = [
+    ['a clear winner: 3/0 against 0/1', [[ALL, []], [[], ['ev-test']]], 0.75],
+    ['close but unequal: 3/0 against 2/0', [[ALL, []], [['ev-test', 'ev-run'], []]], 0.75],
+    ['a contradicted rival citing as much support: 2/0 against 2/1', [[['ev-src', 'ev-run'], []], [['ev-test', 'ev-run'], ['ev-src']]], 0.66],
+    ['a weak rival: 3/0 against 1/0', [[ALL, []], [['ev-test'], []]], 0.75],
+  ];
+  for (const [name, counts, confidence] of selectedCases) {
+    it(`selects ${name}, and reports no selection diagnostics`, async () => {
+      const { planner, events } = setup(replyOf(counts));
+      let context = contextFor();
+      const decisions: PlannerDecision[] = [];
+      for (let step = 0; step < 4; step += 1) {
+        const decision = await planner.next(context);
+        decisions.push(decision);
+        context = apply(context, decision);
+      }
+      assert.deepEqual(events, [{ type: 'escalated', investigationId: 'inv-1', model: 'fake-model', selectedHypothesisId: 'hyp-model-boundary' }]);
+      const proposal = decisions[3];
+      assert.equal(proposal?.type === 'propose_patch' && proposal.proposal.confidence, confidence);
+    });
+  }
+
+  const refusedCases: Array<[string, readonly Counts[], ModelAssessment['edit'], RefusalStage, ReturnType<typeof diagnostic>[]]> = [
+    ['a two-way tie: 3/0 and 3/0', [[ALL, []], [ALL, []]], VALID_REPLY.edit, 'no_exclusive_winner', [diagnostic(3, 0, 0.75), diagnostic(3, 0, 0.75)]],
+    ['a two-way tie on different evidence: 2/0 and 2/0, no edit', [[['ev-src', 'ev-run'], []], [['ev-test', 'ev-run'], []]], null, 'no_exclusive_winner', [diagnostic(2, 0, 0.66), diagnostic(2, 0, 0.66)]],
+    [
+      'a three-way tie at the top: 3/0, 3/0, and 1/0',
+      [[ALL, []], [ALL, []], [['ev-run'], []]],
+      VALID_REPLY.edit,
+      'no_exclusive_winner',
+      [diagnostic(3, 0, 0.75), diagnostic(3, 0, 0.75), diagnostic(1, 0, 0.5)],
+    ],
+    ['three supported equally: 2/0, 2/0, and 2/0', [[['ev-src', 'ev-run'], []], [['ev-test', 'ev-run'], []], [['ev-src', 'ev-test'], []]], VALID_REPLY.edit, 'no_exclusive_winner', [diagnostic(2, 0, 0.66), diagnostic(2, 0, 0.66), diagnostic(2, 0, 0.66)]],
+    ['too little support: 1/0', [[['ev-src'], []]], VALID_REPLY.edit, 'below_selection_threshold', [diagnostic(1, 0, 0.5)]],
+    ['too little support twice: 1/0 and 1/0', [[['ev-src'], []], [['ev-test'], []]], VALID_REPLY.edit, 'below_selection_threshold', [diagnostic(1, 0, 0.5), diagnostic(1, 0, 0.5)]],
+    ['no support: 0/0', [[[], []]], VALID_REPLY.edit, 'no_supported_hypothesis', [diagnostic(0, 0, 0)]],
+    ['no hypothesis with more support than contradiction: 0/1 and 1/1', [[[], ['ev-src']], [['ev-src'], ['ev-test']]], null, 'no_supported_hypothesis', [diagnostic(0, 1, 0), diagnostic(1, 1, 0.33)]],
+  ];
+  for (const [name, counts, edit, stage, diagnostics] of refusedCases) {
+    it(`refuses ${name} (${stage}), reporting each hypothesis's counts and confidence in reply order`, async () => {
+      const { planner, rules, events } = setup(replyOf(counts, edit));
+      assert.deepEqual(await planner.next(contextFor()), RULE_FINISH);
+      assert.equal(rules.seen.length, 1);
+      assert.equal(events.length, 1);
+      const [event] = events;
+      assert.ok(event?.type === 'fallback');
+      const { detail: _detail, ...rest } = event;
+      assert.deepEqual(rest, { type: 'fallback', investigationId: 'inv-1', reason: 'invalid_output', stage, selectionDiagnostics: diagnostics, editPresent: edit !== null });
+    });
+  }
+
+  it('reports numbers and a boolean only, never keys, statements, evidence IDs, or other reply text', async () => {
+    const MARKER = 'marker-5b7u';
+    const reply = {
+      hypotheses: [
+        { key: MARKER, statement: `${MARKER} statement.`, supportingEvidenceIds: ALL, contradictingEvidenceIds: [] },
+        { key: `${MARKER}-rival`, statement: `${MARKER} rival.`, supportingEvidenceIds: ALL, contradictingEvidenceIds: [] },
+      ],
+      edit: { ...VALID_REPLY.edit, hypothesisKey: MARKER },
+    };
+    const { planner, events } = setup(reply);
+    await planner.next(contextFor());
+    const [event] = events;
+    assert.ok(event?.type === 'fallback' && event.stage === 'no_exclusive_winner');
+    assert.ok(event.selectionDiagnostics);
+    for (const item of event.selectionDiagnostics) {
+      assert.deepEqual(Object.keys(item), ['supportingCount', 'contradictingCount', 'computedConfidence']);
+      assert.ok(Object.values(item).every((value) => typeof value === 'number' && Number.isFinite(value)));
+    }
+    assert.equal(typeof event.editPresent, 'boolean');
+    const { detail: _detail, ...safe } = event;
+    const text = JSON.stringify(safe);
+    assert.ok(!text.includes(MARKER), 'no key or statement');
+    assert.ok(!text.includes('ev-'), 'no evidence ID');
+  });
+
+  it('never counts an evidence ID twice: a repeated ID is refused before selection', async () => {
+    const { planner, events } = setup(replyOf([[['ev-src', 'ev-src', 'ev-run'], []], [ALL, []]]));
+    await planner.next(contextFor());
+    const [event] = events;
+    assert.ok(event?.type === 'fallback');
+    assert.equal(event.stage, 'invalid_hypothesis');
+    assert.equal('selectionDiagnostics' in event, false);
   });
 });
 

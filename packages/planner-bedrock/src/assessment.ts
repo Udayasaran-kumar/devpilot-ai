@@ -81,6 +81,13 @@ export type RefusalStage = (typeof REFUSAL_STAGES)[number];
 
 export const MAX_SCHEMA_ISSUES = 5;
 
+/** One hypothesis of a reply, as selection saw it: counts and the confidence they allow, nothing from the reply's text. */
+export interface SelectionDiagnostic {
+  readonly supportingCount: number;
+  readonly contradictingCount: number;
+  readonly computedConfidence: number;
+}
+
 export type EscalationPlanResult =
   | { readonly ok: true; readonly plan: EscalationPlan }
   | {
@@ -92,6 +99,10 @@ export type EscalationPlanResult =
       readonly schemaIssues?: readonly string[];
       /** For `edit_source_not_cited` and `edit_path_unknown`: whether the selected hypothesis cites a `search_result` at exactly the edit's path. */
       readonly citedSearchResultAtEditPath?: boolean;
+      /** For `no_supported_hypothesis`, `below_selection_threshold`, and `no_exclusive_winner`: every hypothesis, in reply order. */
+      readonly selectionDiagnostics?: readonly SelectionDiagnostic[];
+      /** For the same refusals: whether the reply proposed an edit. */
+      readonly editPresent?: boolean;
     };
 
 /**
@@ -144,7 +155,13 @@ export function planEscalation(context: PlannerContext, reply: unknown): Escalat
   }
 
   const selected = chooseHypothesis(assessed);
-  if (!selected) return refuse(selectionFailure(assessed), 'No model hypothesis is supported well enough by the cited evidence to be selected.');
+  if (!selected) {
+    return {
+      ...refuse(selectionFailure(assessed), 'No model hypothesis is supported well enough by the cited evidence to be selected.'),
+      selectionDiagnostics: assessed.map(selectionDiagnostic),
+      editPresent: assessment.edit !== null,
+    };
+  }
 
   const { edit } = assessment;
   if (!edit) return refuse('missing_edit', `The model proposed no edit for ${selected.id}.`);
@@ -308,6 +325,14 @@ function selectionFailure(assessed: readonly Hypothesis[]): RefusalStage {
   const best = supported.reduce<Hypothesis | undefined>((top, item) => (top === undefined || item.confidence > top.confidence ? item : top), undefined);
   if (!best) return 'no_supported_hypothesis';
   return HypothesisSchema.safeParse({ ...best, status: 'selected' }).success ? 'no_exclusive_winner' : 'below_selection_threshold';
+}
+
+function selectionDiagnostic(hypothesis: Hypothesis): SelectionDiagnostic {
+  return {
+    supportingCount: new Set(hypothesis.supportingEvidenceIds).size,
+    contradictingCount: new Set(hypothesis.contradictingEvidenceIds).size,
+    computedConfidence: hypothesis.confidence,
+  };
 }
 
 /** `path: code`, where only schema field names and array indices are kept from the path; anything else becomes `?`. */

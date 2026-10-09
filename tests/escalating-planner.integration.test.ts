@@ -8,8 +8,8 @@ import { describe, it } from 'node:test';
 import { InvestigationEventSchema, type InvestigationEvent, type Signal } from '@devpilot/core';
 import { GroundedRepairPipeline, InvestigationEngine, replayInvestigation } from '@devpilot/engine';
 import { RulePlanner, type Planner } from '@devpilot/planners';
-import { EscalatingPlanner, type EscalationEvent } from '@devpilot/planner-bedrock';
-import { BedrockModelClient } from '@devpilot/planner-bedrock/bedrock';
+import { EscalatingPlanner, type EscalationEvent, type ModelClient } from '@devpilot/planner-bedrock';
+import { BedrockModelClient, renderEscalationPrompt, type EscalationPrompt } from '@devpilot/planner-bedrock/bedrock';
 import { InvestigationService, RepositoryRegistry } from '@devpilot/service';
 import { createDefaultToolRegistry, RepositorySandbox, resolveGitExecutable } from '@devpilot/tools';
 import {
@@ -273,6 +273,75 @@ describe('the Bedrock model client against a local Converse runtime', () => {
     assert.ok(state.evidence.some((item) => item.id === hit), 'the hit was collected');
     assert.ok(!userText(sends[0]!.command).includes(hit), 'but is not offered for citation');
     assert.equal(state.patchProposals.at(-1)?.status, 'awaiting_verification');
+  });
+
+  it('offers exactly three citable evidence IDs for the shipping incident, none of them the folded hit', async () => {
+    const hit = await shippingHitId();
+    const prompts: EscalationPrompt[] = [];
+    const recorder: ModelClient = {
+      name: 'prompt-recorder',
+      assess: async (request) => {
+        prompts.push(renderEscalationPrompt(request));
+        return { hypotheses: [], edit: null };
+      },
+    };
+    const { state } = await investigate(SHIPPING_ROOT, SHIPPING, new EscalatingPlanner({ model: recorder }));
+
+    assert.equal(prompts.length, 1);
+    const [prompt] = prompts;
+    const idOf = (kind: string, file?: string) => state.evidence.find((item) => item.kind === kind && (file === undefined || (item.location.type === 'file' && item.location.path === file)))?.id;
+    assert.deepEqual(
+      [...(prompt?.sentEvidenceIds ?? [])].sort(),
+      [idOf('source_code', 'test/shipping.test.ts'), idOf('source_code', 'src/shipping.ts'), idOf('command_output')].sort(),
+    );
+    assert.deepEqual(prompt?.foldedEvidenceIds, [hit]);
+    assert.deepEqual(prompt?.omittedEvidenceIds, []);
+    assert.ok(!prompt?.sentEvidenceIds.includes(hit));
+  });
+
+  it('a tied shipping assessment reports numeric selection diagnostics, proposes nothing, and leaves the rule outcome', async () => {
+    const MARKER = 'marker-5b7u';
+    const { runtime, sends } = fakeRuntime((command) => {
+      const evidence = promptData(command).evidence;
+      const ids = evidence.map((item) => item.id);
+      const source = evidence.find((item) => item.kind === 'source_code' && item.location.path === 'src/shipping.ts');
+      const line = source?.lines?.find(([, text]) => text === SHIPPING_BUGGY_LINE)?.[0] ?? 0;
+      return converseOutput(
+        JSON.stringify({
+          hypotheses: [
+            { key: 'threshold-comparison', statement: `${MARKER}: ${SHIPPING_STATEMENT}`, supportingEvidenceIds: ids, contradictingEvidenceIds: [] },
+            { key: `${MARKER}-test-expectation`, statement: `${MARKER}: the test expects the wrong total.`, supportingEvidenceIds: ids, contradictingEvidenceIds: [] },
+          ],
+          edit: { hypothesisKey: 'threshold-comparison', path: 'src/shipping.ts', line, originalText: SHIPPING_BUGGY_LINE, replacementText: SHIPPING_FIXED_LINE },
+        }),
+      );
+    });
+    const events: EscalationEvent[] = [];
+    const rules = await investigate(SHIPPING_ROOT, SHIPPING, new RulePlanner());
+    const escalated = await investigate(SHIPPING_ROOT, SHIPPING, new EscalatingPlanner({ model: new BedrockModelClient({ runtime }), onEvent: (event) => events.push(event) }));
+
+    assert.equal(sends.length, 1);
+    assert.equal(promptData(sends[0]!.command).evidence.length, 3);
+    assert.equal(events.length, 1);
+    const [event] = events;
+    assert.ok(event?.type === 'fallback');
+    const { detail: _detail, ...safe } = event;
+    assert.deepEqual(safe, {
+      type: 'fallback',
+      investigationId: 'inv-escalation',
+      reason: 'invalid_output',
+      stage: 'no_exclusive_winner',
+      selectionDiagnostics: [
+        { supportingCount: 3, contradictingCount: 0, computedConfidence: 0.75 },
+        { supportingCount: 3, contradictingCount: 0, computedConfidence: 0.75 },
+      ],
+      editPresent: true,
+    });
+    const text = JSON.stringify(safe);
+    assert.ok(!text.includes(MARKER) && !text.includes('ev-') && !text.includes('shipping'), 'numbers and fixed names only');
+    assert.deepEqual(escalated.state.patchProposals, []);
+    assert.deepEqual(escalated.state.hypotheses, []);
+    assert.equal(normalizeTimings(escalated.events), normalizeTimings(rules.events));
   });
 
   it('repairs the shipping incident from the rendered prompt alone, in one request that names no host path', async () => {

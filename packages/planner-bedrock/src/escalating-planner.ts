@@ -1,5 +1,5 @@
 import { RulePlanner, type Planner, type PlannerContext, type PlannerDecision } from '@devpilot/planners';
-import { planEscalation, type EscalationPlan, type RefusalStage } from './assessment.js';
+import { planEscalation, type EscalationPlan, type RefusalStage, type SelectionDiagnostic } from './assessment.js';
 import { ModelUnavailableError, type EscalationRequest, type ModelClient } from './model-client.js';
 
 export const DEFAULT_MODEL_TIMEOUT_MS = 30_000;
@@ -34,9 +34,16 @@ export type EscalationEvent =
       readonly schemaIssues?: readonly string[];
       /** For an `edit_source_not_cited` or `edit_path_unknown` refusal: whether the selected hypothesis cites a search hit at exactly the edit's path. Safe to log. */
       readonly citedSearchResultAtEditPath?: boolean;
+      /** For a selection refusal: supporting and contradicting counts and computed confidence of every hypothesis, in reply order. Safe to log. */
+      readonly selectionDiagnostics?: readonly SelectionDiagnostic[];
+      /** For a selection refusal: whether the reply proposed an edit. Safe to log. */
+      readonly editPresent?: boolean;
     };
 
-type FallbackDiagnostics = Pick<Extract<EscalationEvent, { type: 'fallback' }>, 'stage' | 'schemaIssues' | 'citedSearchResultAtEditPath'>;
+type FallbackDiagnostics = Pick<
+  Extract<EscalationEvent, { type: 'fallback' }>,
+  'stage' | 'schemaIssues' | 'citedSearchResultAtEditPath' | 'selectionDiagnostics' | 'editPresent'
+>;
 
 export interface EscalatingPlannerOptions {
   readonly model: ModelClient;
@@ -146,6 +153,8 @@ export class EscalatingPlanner implements Planner {
         stage: result.stage,
         ...(result.schemaIssues ? { schemaIssues: result.schemaIssues } : {}),
         ...(result.citedSearchResultAtEditPath !== undefined ? { citedSearchResultAtEditPath: result.citedSearchResultAtEditPath } : {}),
+        ...(result.selectionDiagnostics ? { selectionDiagnostics: result.selectionDiagnostics } : {}),
+        ...(result.editPresent !== undefined ? { editPresent: result.editPresent } : {}),
       });
     }
     const [first] = result.plan.decisions;

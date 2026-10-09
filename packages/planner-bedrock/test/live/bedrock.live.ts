@@ -56,12 +56,18 @@ if (!model) {
   console.log(`model: ${NOVA_PRO_MODEL_ID}`);
   console.log(`region: ${config?.region}`);
   console.log(`modelRequests: ${sends}`);
-  // Never print `detail`: it may quote the model reply. `stage`, `schemaIssues`, and `citedSearchResultAtEditPath` are fixed vocabulary.
+  // Never print `detail`: it may quote the model reply. The other fallback fields are fixed vocabulary, numbers, or booleans.
   const describe = (event: EscalationEvent) =>
     event.type === 'escalated'
       ? 'escalated'
       : `fallback (${event.reason}${event.stage ? ` at ${event.stage}` : ''}${event.schemaIssues?.length ? `; schema: ${event.schemaIssues.join(', ')}` : ''}${
           event.citedSearchResultAtEditPath !== undefined ? `; citedSearchResultAtEditPath: ${event.citedSearchResultAtEditPath}` : ''
+        }${
+          event.selectionDiagnostics
+            ? `; selection (supporting/contradicting confidence): ${event.selectionDiagnostics
+                .map((item) => `${Number(item.supportingCount)}/${Number(item.contradictingCount)} ${Number(item.computedConfidence)}`)
+                .join(', ')}; editPresent: ${event.editPresent === true}`
+            : ''
         })`;
   console.log(`escalation: ${events.map(describe).join(', ') || 'none'}`);
   console.log(`proposal: ${run?.proposal?.status ?? 'none passed review'}`);
