@@ -17,6 +17,14 @@ Tests copy it into a temporary directory before adding hostile entries
 (escaping symlinks, binary files, ignored directories), so the committed copy
 stays plain files only.
 
+## `shipping-repository/`
+
+A one-function shipping quote whose `npm test` fails
+`ships free exactly at the threshold` (`500 !== 0`). The rule planner cannot
+form competing hypotheses for it, so it is the fixture for the model-escalation
+planner in `@devpilot/planner-bedrock`. Tests answer for the model with a fake
+client; the fixture holds no expected answer.
+
 ## Future evaluation fixtures
 
 Each evaluation fixture will live in its own directory and contain:
