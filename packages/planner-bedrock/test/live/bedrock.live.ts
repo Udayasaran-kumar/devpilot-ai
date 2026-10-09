@@ -57,6 +57,7 @@ if (!model) {
   console.log(`region: ${config?.region}`);
   console.log(`modelRequests: ${sends}`);
   // Never print `detail`: it may quote the model reply. The other fallback fields are fixed vocabulary, numbers, or booleans.
+  const CITATIONS: ReadonlySet<string> = new Set(['supporting', 'contradicting', 'none']);
   const describe = (event: EscalationEvent) =>
     event.type === 'escalated'
       ? 'escalated'
@@ -67,6 +68,12 @@ if (!model) {
             ? `; selection (supporting/contradicting confidence): ${event.selectionDiagnostics
                 .map((item) => `${Number(item.supportingCount)}/${Number(item.contradictingCount)} ${Number(item.computedConfidence)}`)
                 .join(', ')}; editPresent: ${event.editPresent === true}`
+            : ''
+        }${
+          event.editSourceCitedAs
+            ? `; editSourceCitedAs: ${CITATIONS.has(event.editSourceCitedAs) ? event.editSourceCitedAs : 'unknown'}; editSourceCitedByRival: ${
+                event.editSourceCitedByRival && CITATIONS.has(event.editSourceCitedByRival) ? event.editSourceCitedByRival : 'unknown'
+              }; editTargetsSignalTest: ${event.editTargetsSignalTest === true}`
             : ''
         })`;
   console.log(`escalation: ${events.map(describe).join(', ') || 'none'}`);

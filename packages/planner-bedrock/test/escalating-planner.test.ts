@@ -415,6 +415,9 @@ describe('EscalatingPlanner: invalid model output leaves the rule decision uncha
       const selectionStage = stage === 'no_supported_hypothesis' || stage === 'below_selection_threshold' || stage === 'no_exclusive_winner';
       assert.equal(event?.type === 'fallback' && 'selectionDiagnostics' in event, selectionStage, 'selection diagnostics accompany selection refusals only');
       assert.equal(event?.type === 'fallback' && 'editPresent' in event, selectionStage, 'editPresent accompanies selection refusals only');
+      for (const field of ['editSourceCitedAs', 'editSourceCitedByRival', 'editTargetsSignalTest']) {
+        assert.equal(event?.type === 'fallback' && field in event, stage === 'edit_source_not_cited', `${field} accompanies edit_source_not_cited refusals only`);
+      }
       assert.equal(planner.latch, undefined, 'invalid output does not disable escalation');
 
       await planner.next(contextFor());
@@ -485,6 +488,87 @@ describe('EscalatingPlanner: invalid model output leaves the rule decision uncha
     const { planner, events } = setup(VALID_REPLY);
     await planner.next(contextFor('inv-1', { evidence: [...EVIDENCE, otherHit] }));
     assert.deepEqual(events.map((event) => event.type), ['escalated'], 'an accepted reply reports no diagnostic');
+  });
+
+  describe('how an uncited edit source is cited, in fixed vocabulary only', () => {
+    /** A second read of src/quote.ts: the edit path then has two source items. */
+    const window: Evidence = {
+      id: 'ev-src-window',
+      kind: 'source_code',
+      summary: 'src/quote.ts',
+      content: SOURCE,
+      location: { type: 'file', path: 'src/quote.ts', startLine: 1 },
+      source: { tool: 'read_file', actionId: 'action-5' },
+      collectedAt: AT,
+    };
+    type Cites = readonly [supporting: readonly string[], contradicting: readonly string[]];
+    const replyCiting = (selected: Cites, rivals: readonly Cites[], edit: Partial<NonNullable<ModelAssessment['edit']>> = {}) => ({
+      hypotheses: [selected, ...rivals].map(([supportingEvidenceIds, contradictingEvidenceIds], index) => ({
+        key: index === 0 ? 'boundary' : `rival-${index}`,
+        statement: `Hypothesis ${index}.`,
+        supportingEvidenceIds: [...supportingEvidenceIds],
+        contradictingEvidenceIds: [...contradictingEvidenceIds],
+      })),
+      edit: { ...VALID_REPLY.edit, ...edit },
+    });
+    const SELECTED: Cites = [['ev-test', 'ev-run'], []];
+    const diagnosticsOf = async (reply: object, evidence: Evidence[] = [...EVIDENCE, window]) => {
+      const { planner, events } = setup(reply);
+      await planner.next(contextFor('inv-1', { evidence }));
+      const [event] = events;
+      assert.ok(event?.type === 'fallback');
+      assert.equal(event.stage, 'edit_source_not_cited');
+      return [event.editSourceCitedAs, event.editSourceCitedByRival, event.editTargetsSignalTest];
+    };
+
+    const cases: Array<[string, object, readonly [string, string, boolean]]> = [
+      ['no hypothesis cites the edited source', replyCiting(SELECTED, []), ['none', 'none', false]],
+      ['a rival cites other evidence only', replyCiting(SELECTED, [[['ev-run'], ['ev-test']]]), ['none', 'none', false]],
+      ['the selected hypothesis cites the edited source as contradicting', replyCiting([['ev-test', 'ev-run', 'ev-hit'], ['ev-src']], []), ['contradicting', 'none', false]],
+      ['a rival supports the edited source', replyCiting(SELECTED, [[['ev-src'], []]]), ['none', 'supporting', false]],
+      ['a rival contradicts the edited source', replyCiting(SELECTED, [[['ev-run'], ['ev-src']]]), ['none', 'contradicting', false]],
+      ['a rival contradicts the other read of the same path', replyCiting(SELECTED, [[[], ['ev-src-window']]]), ['none', 'contradicting', false]],
+      ['rivals contradict and then support: supporting wins', replyCiting(SELECTED, [[[], ['ev-src']], [['ev-src-window'], []]]), ['none', 'supporting', false]],
+      ['rivals support and then contradict: supporting wins', replyCiting(SELECTED, [[['ev-src-window'], []], [[], ['ev-src']]]), ['none', 'supporting', false]],
+      ['two rivals contradict: contradicting', replyCiting(SELECTED, [[[], ['ev-src']], [[], ['ev-src-window']]]), ['none', 'contradicting', false]],
+      [
+        'the edit is to the test file, which no located failing test identifies here',
+        replyCiting([['ev-src', 'ev-run'], []], [], { path: 'test/quote.test.ts', line: 3, originalText: '  assert.equal(quote(1, 1).value, 0);', replacementText: '  assert.equal(quote(1, 1).value, 1);' }),
+        ['none', 'none', false],
+      ],
+    ];
+    for (const [name, reply, expected] of cases) {
+      it(`reports ${expected.join(' / ')} when ${name}`, async () => {
+        assert.deepEqual(await diagnosticsOf(reply), expected);
+      });
+    }
+
+    it('never reports a supporting citation by the selected hypothesis: that would have grounded the edit', async () => {
+      const { planner, events } = setup(replyCiting([['ev-src-window', 'ev-test', 'ev-run'], []], []));
+      await planner.next(contextFor('inv-1', { evidence: [...EVIDENCE, window] }));
+      assert.deepEqual(events.map((event) => event.type), ['escalated']);
+    });
+
+    it('carries no keys, statements, evidence IDs, paths, or line text', async () => {
+      const MARKER = 'marker5b7x';
+      const marked: Evidence = { ...window, id: `ev-${MARKER}`, summary: MARKER };
+      const reply = {
+        hypotheses: [
+          { key: `${MARKER}-selected`, statement: `${MARKER} selected.`, supportingEvidenceIds: ['ev-test', 'ev-run'], contradictingEvidenceIds: [] },
+          { key: `${MARKER}-rival`, statement: `${MARKER} rival.`, supportingEvidenceIds: [], contradictingEvidenceIds: [`ev-${MARKER}`] },
+        ],
+        edit: { ...VALID_REPLY.edit, hypothesisKey: `${MARKER}-selected`, replacementText: `${REPLACEMENT} // ${MARKER}` },
+      };
+      const { planner, events } = setup(reply);
+      await planner.next(contextFor('inv-1', { evidence: [...EVIDENCE, marked] }));
+      const [event] = events;
+      assert.ok(event?.type === 'fallback');
+      assert.equal(event.stage, 'edit_source_not_cited');
+      assert.equal(event.editSourceCitedByRival, 'contradicting', 'the marked item was used');
+      const { detail: _detail, ...safe } = event;
+      const text = JSON.stringify(safe);
+      for (const forbidden of [MARKER, 'ev-', 'src/quote.ts', ORIGINAL.trim()]) assert.ok(!text.includes(forbidden), forbidden);
+    });
   });
 
   it('reports a non-object reply as a root type issue', async () => {

@@ -501,6 +501,123 @@ describe('the Bedrock model client against a local Converse runtime', () => {
         }
       });
     }
+
+    interface Hypothesis {
+      readonly key: string;
+      readonly statement: string;
+      readonly supportingEvidenceIds: readonly string[];
+      readonly contradictingEvidenceIds: readonly string[];
+    }
+    interface EditShape {
+      readonly hypotheses: readonly Hypothesis[];
+      readonly edit: { readonly hypothesisKey: string; readonly path: string; readonly originalText: string; readonly replacementText: string };
+    }
+    const TEST_ASSERTION = '  assert.equal(quote.shipping, 0);';
+    const CODE_BUG = 'threshold-comparison';
+    const TEST_BUG = 'test-expectation';
+    const TEST_BUG_STATEMENT = 'The test expects free shipping at the threshold, but the threshold order should pay the flat rate.';
+    /** Selected hypotheses cite exactly two supporting items (confidence 0.66); every rival scores lower, so selection passes and the edit-source check refuses. */
+    type EditSourceDiagnostics = readonly [editSourceCitedAs: string, editSourceCitedByRival: string, editTargetsSignalTest: boolean];
+    const shapes: Array<[string, (ids: Omit<ShippingIds, 'hit'>) => EditShape, EditSourceDiagnostics]> = [
+      [
+        'B1: the selected hypothesis supports the test file and test run and edits src/shipping.ts; no rival cites that file',
+        (ids) => ({
+          hypotheses: [
+            { key: CODE_BUG, statement: SHIPPING_STATEMENT, supportingEvidenceIds: [ids.test, ids.run], contradictingEvidenceIds: [] },
+            { key: 'flat-rate', statement: 'The caller passes the wrong flat rate.', supportingEvidenceIds: [], contradictingEvidenceIds: [ids.test] },
+          ],
+          edit: { hypothesisKey: CODE_BUG, path: 'src/shipping.ts', originalText: SHIPPING_BUGGY_LINE, replacementText: SHIPPING_FIXED_LINE },
+        }),
+        ['none', 'none', false],
+      ],
+      [
+        'B2: as B1, with a distinct rival that src/shipping.ts contradicts',
+        (ids) => ({
+          hypotheses: [
+            { key: CODE_BUG, statement: SHIPPING_STATEMENT, supportingEvidenceIds: [ids.test, ids.run], contradictingEvidenceIds: [] },
+            { key: TEST_BUG, statement: TEST_BUG_STATEMENT, supportingEvidenceIds: [ids.run], contradictingEvidenceIds: [ids.src] },
+          ],
+          edit: { hypothesisKey: CODE_BUG, path: 'src/shipping.ts', originalText: SHIPPING_BUGGY_LINE, replacementText: SHIPPING_FIXED_LINE },
+        }),
+        ['none', 'contradicting', false],
+      ],
+      [
+        'B3: the selected hypothesis supports src/shipping.ts and the test run and edits test/shipping.test.ts, which it does not cite',
+        (ids) => ({
+          hypotheses: [
+            { key: TEST_BUG, statement: TEST_BUG_STATEMENT, supportingEvidenceIds: [ids.src, ids.run], contradictingEvidenceIds: [] },
+            { key: CODE_BUG, statement: SHIPPING_STATEMENT, supportingEvidenceIds: [ids.test], contradictingEvidenceIds: [] },
+          ],
+          edit: { hypothesisKey: TEST_BUG, path: 'test/shipping.test.ts', originalText: TEST_ASSERTION, replacementText: '  assert.equal(quote.shipping, 500);' },
+        }),
+        ['none', 'supporting', true],
+      ],
+    ];
+
+    it('B1, B2, and B3 share a refusal stage but report distinct edit-source diagnostics', () => {
+      const reported = shapes.map(([, , diagnostics]) => JSON.stringify(diagnostics));
+      assert.equal(new Set(reported).size, shapes.length);
+    });
+
+    for (const [name, shape, diagnostics] of shapes) {
+      it(`${name}: edit_source_not_cited, with no proposal and no repair`, async () => {
+        const answer = () =>
+          fakeRuntime((command) => {
+            const evidence = promptData(command).evidence;
+            const idOf = (kind: string, file?: string) => evidence.find((item) => item.kind === kind && (file === undefined || item.location.path === file))?.id ?? '';
+            const ids = { src: idOf('source_code', 'src/shipping.ts'), test: idOf('source_code', 'test/shipping.test.ts'), run: idOf('command_output') };
+            assert.ok(ids.src && ids.test && ids.run, 'every cited ID is one the prompt shows');
+            const { hypotheses, edit } = shape(ids);
+            const edited = evidence.find((item) => item.kind === 'source_code' && item.location.path === edit.path);
+            const line = edited?.lines?.find(([, text]) => text === edit.originalText)?.[0];
+            assert.ok(line !== undefined, 'the edit quotes a line the prompt shows');
+            return converseOutput(JSON.stringify({ hypotheses, edit: { ...edit, line } }));
+          });
+
+        const events: EscalationEvent[] = [];
+        const replies = answer();
+        const rules = await investigate(SHIPPING_ROOT, SHIPPING, new RulePlanner());
+        const escalated = await investigate(SHIPPING_ROOT, SHIPPING, new EscalatingPlanner({ model: new BedrockModelClient({ runtime: replies.runtime }), onEvent: (event) => events.push(event) }));
+        assert.equal(replies.sends.length, 1);
+        assert.deepEqual(
+          events.map((event) => [event.type, event.type === 'fallback' && [event.reason, event.stage, event.citedSearchResultAtEditPath]]),
+          [['fallback', ['invalid_output', 'edit_source_not_cited', false]]],
+          'refused at the edit-source check, after selection passed, and never reported as escalated',
+        );
+        const [event] = events;
+        assert.ok(event?.type === 'fallback');
+        assert.deepEqual([event.editSourceCitedAs, event.editSourceCitedByRival, event.editTargetsSignalTest], diagnostics);
+        const { detail: _detail, ...safe } = event;
+        for (const forbidden of ['ev-', 'shipping', SHIPPING_BUGGY_LINE.trim(), TEST_BUG_STATEMENT]) {
+          assert.ok(!JSON.stringify(safe).includes(forbidden), `the diagnostics carry no ${forbidden}`);
+        }
+        assert.deepEqual(escalated.state.patchProposals, []);
+        assert.deepEqual(escalated.state.hypotheses, [], 'the rule outcome stands');
+        assert.equal(normalizeTimings(escalated.events), normalizeTimings(rules.events));
+
+        const realGit = await resolveGitExecutable();
+        const fixture = await createGitRepositoryFixture(realGit, SHIPPING_ROOT);
+        const pipelineReplies = answer();
+        const pipelineEvents: EscalationEvent[] = [];
+        const run = await new GroundedRepairPipeline({
+          allowedRoot: fixture.allowedRoot,
+          git: realGit,
+          planner: new EscalatingPlanner({ model: new BedrockModelClient({ runtime: pipelineReplies.runtime }), onEvent: (event) => pipelineEvents.push(event) }),
+        }).run({ repositoryRoot: fixture.root, signal: SHIPPING });
+        try {
+          assert.equal(pipelineReplies.sends.length, 1);
+          assert.deepEqual(
+            pipelineEvents.map((event) => event.type === 'fallback' && event.stage),
+            ['edit_source_not_cited'],
+          );
+          assert.equal(run.proposal, undefined, 'no proposal passed review');
+          assert.equal(run.repair, undefined, 'no repair was attempted');
+        } finally {
+          await run.repair?.workspace?.remove();
+          await fixture.cleanup();
+        }
+      });
+    }
   });
 
   it('is never asked about an incident the rules explain', async () => {

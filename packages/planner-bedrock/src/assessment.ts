@@ -88,6 +88,9 @@ export interface SelectionDiagnostic {
   readonly computedConfidence: number;
 }
 
+/** How a hypothesis cites the source read at the edit's path: `supporting` if it supports any such item, else `contradicting` if it contradicts one, else `none`. */
+export type EditSourceCitation = 'supporting' | 'contradicting' | 'none';
+
 export type EscalationPlanResult =
   | { readonly ok: true; readonly plan: EscalationPlan }
   | {
@@ -103,6 +106,12 @@ export type EscalationPlanResult =
       readonly selectionDiagnostics?: readonly SelectionDiagnostic[];
       /** For the same refusals: whether the reply proposed an edit. */
       readonly editPresent?: boolean;
+      /** For `edit_source_not_cited`: how the selected hypothesis cites the source read at exactly the edit's path. */
+      readonly editSourceCitedAs?: EditSourceCitation;
+      /** For `edit_source_not_cited`: the strongest citation of that source by any other hypothesis (`supporting`, then `contradicting`, then `none`). */
+      readonly editSourceCitedByRival?: EditSourceCitation;
+      /** For `edit_source_not_cited`: whether that source is the failing test's file, as located from the reproduction run. */
+      readonly editTargetsSignalTest?: boolean;
     };
 
 /**
@@ -172,10 +181,12 @@ export function planEscalation(context: PlannerContext, reply: unknown): Escalat
 
   const source = sourceEvidence(context.evidence, selected, edit.path);
   if (!source) {
-    const stage = context.evidence.some((item) => isSourceAt(item, edit.path)) ? 'edit_source_not_cited' : 'edit_path_unknown';
+    const sourcesAtPath = new Set(context.evidence.filter((item) => isSourceAt(item, edit.path)).map((item) => item.id));
+    const stage = sourcesAtPath.size > 0 ? 'edit_source_not_cited' : 'edit_path_unknown';
     return {
       ...refuse(stage, `${JSON.stringify(edit.path)} is not a file read as supporting evidence for ${selected.id}.`),
       citedSearchResultAtEditPath: citesSearchResultAt(context.evidence, selected, edit.path),
+      ...(stage === 'edit_source_not_cited' ? editSourceDiagnostics(context, assessed, selected, sourcesAtPath) : {}),
     };
   }
   const lines = numberLines(source.content, source.startLine);
@@ -249,6 +260,28 @@ type FileSource = Evidence & { readonly content: string; readonly location: Extr
 function citesSearchResultAt(evidence: readonly Evidence[], selected: Hypothesis, filePath: string): boolean {
   const support = new Set(selected.supportingEvidenceIds);
   return evidence.some((item) => support.has(item.id) && item.kind === 'search_result' && item.location.type === 'file' && item.location.path === filePath);
+}
+
+/** How the selected hypothesis and its rivals cite the sources read at the edit's path, and whether one is the failing test's file. */
+function editSourceDiagnostics(
+  context: PlannerContext,
+  assessed: readonly Hypothesis[],
+  selected: Hypothesis,
+  sources: ReadonlySet<string>,
+): { editSourceCitedAs: EditSourceCitation; editSourceCitedByRival: EditSourceCitation; editTargetsSignalTest: boolean } {
+  const citation = (hypothesis: Hypothesis): EditSourceCitation =>
+    hypothesis.supportingEvidenceIds.some((id) => sources.has(id))
+      ? 'supporting'
+      : hypothesis.contradictingEvidenceIds.some((id) => sources.has(id))
+        ? 'contradicting'
+        : 'none';
+  const rivals = assessed.filter((item) => item.id !== selected.id).map(citation);
+  const failingTest = analyzeInvestigation(context).failingTest?.evidence?.id;
+  return {
+    editSourceCitedAs: citation(selected),
+    editSourceCitedByRival: rivals.includes('supporting') ? 'supporting' : rivals.includes('contradicting') ? 'contradicting' : 'none',
+    editTargetsSignalTest: failingTest !== undefined && sources.has(failingTest),
+  };
 }
 
 /** File content read with read_file at exactly this path; no normalization. */
