@@ -404,6 +404,182 @@ describe('the Bedrock model client against a local Converse runtime', () => {
     }
   });
 
+  describe('two supporting items per hypothesis: only a genuine contradiction of the rival breaks the tie', () => {
+    interface ReplyHypothesis {
+      readonly key: string;
+      readonly statement: string;
+      readonly supportingEvidenceIds: readonly string[];
+      readonly contradictingEvidenceIds: readonly string[];
+    }
+    interface CitableIds {
+      readonly src: string;
+      readonly test: string;
+      readonly run: string;
+    }
+    type Shape = (ids: CitableIds) => readonly ReplyHypothesis[];
+    const CODE_BUG = 'threshold-comparison';
+    const PARAPHRASE_STATEMENT = 'An order of exactly the threshold amount is charged the flat rate because the comparison leaves the threshold out.';
+    const TEST_BUG_STATEMENT = 'The test expects free shipping at the threshold, but the threshold order should pay the flat rate.';
+    const TWO_SUPPORTING = { supportingCount: 2, contradictingCount: 0, computedConfidence: 0.66 };
+    const codeBug = (support: readonly string[]): ReplyHypothesis => ({ key: CODE_BUG, statement: SHIPPING_STATEMENT, supportingEvidenceIds: support, contradictingEvidenceIds: [] });
+    const testBug = (support: readonly string[], contradicting: readonly string[] = []): ReplyHypothesis => ({
+      key: 'test-expectation',
+      statement: TEST_BUG_STATEMENT,
+      supportingEvidenceIds: support,
+      contradictingEvidenceIds: contradicting,
+    });
+
+    /** Replies with the shape's hypotheses and the code-bug edit of src/shipping.ts, from evidence IDs and line content the rendered prompt shows. */
+    const answer = (shape: Shape) => {
+      const replies: string[] = [];
+      const recorded = fakeRuntime((command) => {
+        const evidence = promptData(command).evidence;
+        const idOf = (kind: string, file?: string) => evidence.find((item) => item.kind === kind && (file === undefined || item.location.path === file))?.id ?? '';
+        const ids = { src: idOf('source_code', 'src/shipping.ts'), test: idOf('source_code', 'test/shipping.test.ts'), run: idOf('command_output') };
+        assert.ok(ids.src && ids.test && ids.run, 'every cited ID is one the prompt shows');
+        const line = evidence.find((item) => item.id === ids.src)?.lines?.find(([, text]) => text === SHIPPING_BUGGY_LINE)?.[0];
+        assert.ok(line !== undefined, 'the edit quotes a line the prompt shows');
+        const reply = JSON.stringify({
+          hypotheses: shape(ids),
+          edit: { hypothesisKey: CODE_BUG, path: 'src/shipping.ts', line, originalText: SHIPPING_BUGGY_LINE, replacementText: SHIPPING_FIXED_LINE },
+        });
+        replies.push(reply);
+        return converseOutput(reply);
+      });
+      return { ...recorded, replies };
+    };
+
+    const ties: Array<[string, Shape]> = [
+      [
+        'E1: a rewording of the code bug, citing the same evidence',
+        (ids) => [
+          codeBug([ids.src, ids.run]),
+          { key: 'threshold-excluded', statement: PARAPHRASE_STATEMENT, supportingEvidenceIds: [ids.src, ids.run], contradictingEvidenceIds: [] },
+        ],
+      ],
+      ['E2a: a distinct test-bug cause, citing the same evidence', (ids) => [codeBug([ids.src, ids.run]), testBug([ids.src, ids.run])]],
+      ['E2b: a distinct test-bug cause, citing overlapping evidence', (ids) => [codeBug([ids.src, ids.run]), testBug([ids.test, ids.run])]],
+    ];
+
+    let rulesLog: Promise<string> | undefined;
+    const rulesOnly = () => (rulesLog ??= investigate(SHIPPING_ROOT, SHIPPING, new RulePlanner()).then(({ events }) => normalizeTimings(events)));
+    async function runTie(shape: Shape) {
+      const model = answer(shape);
+      const events: EscalationEvent[] = [];
+      const { events: log, state } = await investigate(
+        SHIPPING_ROOT,
+        SHIPPING,
+        new EscalatingPlanner({ model: new BedrockModelClient({ runtime: model.runtime }), onEvent: (event) => events.push(event) }),
+      );
+      return { sends: model.sends.length, replies: model.replies, events, state, log: normalizeTimings(log) };
+    }
+    /** Each tie is investigated once and shared by its own test and the comparison across ties. */
+    const tieRuns = new Map<string, ReturnType<typeof runTie>>();
+    const tie = (name: string, shape: Shape) => {
+      const run = tieRuns.get(name) ?? runTie(shape);
+      tieRuns.set(name, run);
+      return run;
+    };
+
+    for (const [name, shape] of ties) {
+      it(`${name}: refused at no_exclusive_winner with 2/0 versus 2/0, proposing nothing`, async () => {
+        const run = await tie(name, shape);
+        assert.equal(run.sends, 1);
+        assert.equal(run.events.length, 1);
+        const [event] = run.events;
+        assert.ok(event?.type === 'fallback');
+        const { detail: _detail, ...safe } = event;
+        assert.deepEqual(safe, {
+          type: 'fallback',
+          investigationId: 'inv-escalation',
+          reason: 'invalid_output',
+          stage: 'no_exclusive_winner',
+          selectionDiagnostics: [TWO_SUPPORTING, TWO_SUPPORTING],
+          editPresent: true,
+        });
+        const text = JSON.stringify(safe);
+        for (const forbidden of ['ev-', 'shipping', 'threshold', SHIPPING_BUGGY_LINE.trim()]) {
+          assert.ok(!text.includes(forbidden), `the refusal carries no ${forbidden}`);
+        }
+        assert.deepEqual(run.state.patchProposals, []);
+        assert.deepEqual(run.state.hypotheses, [], 'no model hypothesis is recorded');
+        assert.equal(run.log, await rulesOnly(), 'the rule outcome stands');
+      });
+    }
+
+    it('E1, E2a, and E2b send different replies but emit the same refusal event apart from detail', async () => {
+      const runs = await Promise.all(ties.map(([name, shape]) => tie(name, shape)));
+      assert.equal(new Set(runs.map((run) => run.replies.join('\n'))).size, ties.length, 'the replies differ');
+      const emitted = runs.map((run) =>
+        run.events.map((event) => {
+          assert.ok(event.type === 'fallback');
+          const { detail: _detail, ...safe } = event;
+          return safe;
+        }),
+      );
+      assert.deepEqual(
+        emitted[0]?.map((event) => event.stage),
+        ['no_exclusive_winner'],
+      );
+      for (const events of emitted.slice(1)) assert.deepEqual(events, emitted[0]);
+    });
+
+    it('E3: the same counts with one genuine contradiction of the rival select the code bug and repair it', async () => {
+      const contradicted: Shape = (ids) => [codeBug([ids.src, ids.run]), testBug([ids.test, ids.run], [ids.src])];
+      const model = answer(contradicted);
+      const events: EscalationEvent[] = [];
+      const { state } = await investigate(
+        SHIPPING_ROOT,
+        SHIPPING,
+        new EscalatingPlanner({ model: new BedrockModelClient({ runtime: model.runtime }), onEvent: (event) => events.push(event) }),
+      );
+      assert.equal(model.sends.length, 1);
+      assert.deepEqual(events, [
+        { type: 'escalated', investigationId: 'inv-escalation', model: 'bedrock:amazon.nova-pro-v1:0', selectedHypothesisId: 'hyp-model-threshold-comparison' },
+      ]);
+      assert.deepEqual(
+        state.hypotheses.map((item) => [item.id, item.status, item.confidence]),
+        [
+          ['hyp-model-threshold-comparison', 'selected', 0.66],
+          ['hyp-model-test-expectation', 'supported', 0.5],
+        ],
+      );
+      const record = state.patchProposals.at(-1);
+      assert.equal(record?.status, 'awaiting_verification');
+      assert.deepEqual(record?.violations, []);
+      assert.deepEqual(record?.proposal.affectedPaths, ['src/shipping.ts']);
+      assert.match(record?.proposal.patch ?? '', new RegExp(`^-${escape(SHIPPING_BUGGY_LINE)}\\n\\+${escape(SHIPPING_FIXED_LINE)}$`, 'm'));
+
+      const realGit = await resolveGitExecutable();
+      const fixture = await createGitRepositoryFixture(realGit, SHIPPING_ROOT);
+      const pipelineModel = answer(contradicted);
+      const pipelineEvents: EscalationEvent[] = [];
+      const run = await new GroundedRepairPipeline({
+        allowedRoot: fixture.allowedRoot,
+        git: realGit,
+        planner: new EscalatingPlanner({ model: new BedrockModelClient({ runtime: pipelineModel.runtime }), onEvent: (event) => pipelineEvents.push(event) }),
+      }).run({ repositoryRoot: fixture.root, signal: SHIPPING });
+      try {
+        assert.equal(pipelineModel.sends.length, 1);
+        assert.deepEqual(pipelineEvents, [
+          {
+            type: 'escalated',
+            investigationId: pipelineEvents[0]?.investigationId,
+            model: 'bedrock:amazon.nova-pro-v1:0',
+            selectedHypothesisId: 'hyp-model-threshold-comparison',
+          },
+        ]);
+        assert.equal(run.proposal?.status, 'awaiting_verification');
+        assert.equal(run.repair?.result.status, 'repaired', run.repair?.result.reason ?? undefined);
+        assert.equal(run.grounding.valid, true);
+        assert.equal(run.report.selectedHypothesis?.id, 'hyp-model-threshold-comparison');
+      } finally {
+        await run.repair?.workspace?.remove();
+        await fixture.cleanup();
+      }
+    });
+  });
+
   it('repairs the shipping incident from the rendered prompt alone, in one request that names no host path', async () => {
     const realGit = await resolveGitExecutable();
     const fixture = await createGitRepositoryFixture(realGit, SHIPPING_ROOT);
