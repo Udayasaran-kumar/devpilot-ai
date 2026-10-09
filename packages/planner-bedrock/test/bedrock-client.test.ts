@@ -80,6 +80,18 @@ describe('BedrockModelClient', () => {
     });
   }
 
+  it('refuses a reply citing a search hit folded into a source item, which was never sent as an item', async () => {
+    const hit = { id: 'ev-hit', kind: 'search_result', summary: 'src/quote.ts:2 contains "b"', location: { type: 'file', path: 'src/quote.ts', startLine: 2, endLine: 2 }, content: 'b' } as const;
+    const request: EscalationRequest = { ...REQUEST, evidence: [...REQUEST.evidence, hit] };
+    assert.deepEqual(renderEscalationPrompt(request).foldedEvidenceIds, ['ev-hit']);
+    const citing = (ids: string[]) =>
+      replying(converseOutput(JSON.stringify({ hypotheses: [{ key: 'k', statement: 's', supportingEvidenceIds: ids, contradictingEvidenceIds: [] }], edit: null }))).client.assess(request, {
+        signal: new AbortController().signal,
+      });
+    await assert.rejects(citing(['ev-hit', 'ev-run']), (error: unknown) => error instanceof BedrockReplyError && /not sent/.test(error.message));
+    assert.ok(await citing(['ev-src', 'ev-run']), 'the source item it was folded into can be cited');
+  });
+
   const awsError = (name: string, status?: number) =>
     Object.assign(new Error(`User: arn:aws:sts::123456789012:assumed-role/Role/session is not authorized ${MARKER}`), {
       name,

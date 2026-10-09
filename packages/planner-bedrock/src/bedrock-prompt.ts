@@ -77,6 +77,8 @@ export interface EscalationPrompt {
   readonly sentEvidenceIds: readonly string[];
   /** IDs left out to stay within `MAX_PROMPT_EVIDENCE_CHARS`. */
   readonly omittedEvidenceIds: readonly string[];
+  /** Search hits sent only as `matchedLines` of the source item that shows the same line; a reply may not cite them. */
+  readonly foldedEvidenceIds: readonly string[];
 }
 
 type NumberedLine = readonly [number, string];
@@ -89,6 +91,7 @@ interface PromptEvidence {
   readonly lines?: readonly NumberedLine[];
   readonly content?: string;
   readonly truncated?: true;
+  readonly matchedLines?: readonly number[];
 }
 
 /**
@@ -96,20 +99,37 @@ interface PromptEvidence {
  * credential-shaped strings are replaced, source files are sent as
  * `[line, text]` pairs so an edit can be quoted exactly, every part is
  * bounded, and the data is JSON-encoded so its content cannot close it.
- * Evidence IDs and repository-relative paths are sent unchanged.
+ * Evidence IDs and repository-relative paths are sent unchanged. A search
+ * hit that repeats a line of a source item already sent becomes that item's
+ * `matchedLines` entry rather than an item of its own.
  */
 export function renderEscalationPrompt(request: EscalationRequest, options: PromptOptions = {}): EscalationPrompt {
   const redact = redactor([homedir(), ...(options.hostPaths ?? [])]);
   const sent: PromptEvidence[] = [];
+  const sources: SentSource[] = [];
   const omitted: string[] = [];
+  const folded: string[] = [];
   let used = 0;
   for (const item of prioritized(request.evidence)) {
+    const match = foldTarget(item, sources, sent);
+    if (match) {
+      const entry = sent[match.index] as PromptEvidence;
+      const matched = { ...entry, matchedLines: [...new Set([...(entry.matchedLines ?? []), match.line])].sort((a, b) => a - b) };
+      const growth = sizeOf(matched) - sizeOf(entry);
+      if (used + growth <= MAX_PROMPT_EVIDENCE_CHARS) {
+        sent[match.index] = matched;
+        used += growth;
+        folded.push(item.id);
+        continue;
+      }
+    }
     const rendered = renderEvidence(item, redact);
-    const size = JSON.stringify(rendered).length + 1;
+    const size = sizeOf(rendered);
     if (used + size > MAX_PROMPT_EVIDENCE_CHARS) {
       omitted.push(item.id);
       continue;
     }
+    if (item.kind === 'source_code') sources.push({ item, index: sent.length });
     sent.push(rendered);
     used += size;
   }
@@ -129,7 +149,33 @@ export function renderEscalationPrompt(request: EscalationRequest, options: Prom
     user: `${DATA_HEADER}\n${JSON.stringify(data)}`,
     sentEvidenceIds: sent.map((item) => item.id),
     omittedEvidenceIds: omitted,
+    foldedEvidenceIds: folded,
   };
+}
+
+const sizeOf = (entry: PromptEvidence) => JSON.stringify(entry).length + 1;
+
+interface SentSource {
+  readonly item: EscalationEvidence;
+  /** Position of its rendered entry in the evidence sent. */
+  readonly index: number;
+}
+
+/**
+ * The first source item sent that shows a search hit's line exactly: the same
+ * path, the hit's line among the lines sent, and the same text. Paths, line
+ * numbers, and text are compared as collected, without normalization.
+ */
+function foldTarget(hit: EscalationEvidence, sources: readonly SentSource[], sent: readonly PromptEvidence[]): { index: number; line: number } | undefined {
+  if (hit.kind !== 'search_result' || hit.location.type !== 'file' || hit.content === undefined) return undefined;
+  const { path: hitPath, startLine: line, endLine } = hit.location;
+  if (line === undefined || (endLine !== undefined && endLine !== line)) return undefined;
+  for (const { item, index } of sources) {
+    if (item.location.type !== 'file' || item.location.path !== hitPath || item.content === undefined) continue;
+    if (!sent[index]?.lines?.some(([sentLine]) => sentLine === line)) continue;
+    if (item.content.split(/\r?\n/)[line - (item.location.startLine ?? 1)] === hit.content) return { index, line };
+  }
+  return undefined;
 }
 
 /** Source files first (edits are grounded in them), then command and test output, then everything else. */

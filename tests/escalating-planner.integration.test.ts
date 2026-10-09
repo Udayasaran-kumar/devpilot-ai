@@ -245,6 +245,36 @@ describe('InvestigationService with the escalating planner', () => {
 });
 
 describe('the Bedrock model client against a local Converse runtime', () => {
+  /** The ID of the search hit the rules collect at src/shipping.ts:9; evidence IDs are the same in every run. */
+  const shippingHitId = async () => {
+    const { state } = await investigate(SHIPPING_ROOT, SHIPPING, new RulePlanner());
+    const hits = state.evidence.filter((item) => item.kind === 'search_result');
+    assert.deepEqual(
+      hits.map((item) => item.location.type === 'file' && [item.location.path, item.location.startLine, item.content]),
+      [['src/shipping.ts', 9, SHIPPING_BUGGY_LINE]],
+    );
+    return hits[0]?.id ?? '';
+  };
+
+  it('sends the shipping search hit only as line 9 of src/shipping.ts, as three citable items', async () => {
+    const hit = await shippingHitId();
+    const { runtime, sends } = shippingRuntime();
+    const { state } = await investigate(SHIPPING_ROOT, SHIPPING, new EscalatingPlanner({ model: new BedrockModelClient({ runtime }) }));
+
+    assert.equal(sends.length, 1);
+    assert.deepEqual(
+      promptData(sends[0]!.command).evidence.map((item) => [item.kind, item.location.path ?? item.location.command, item.matchedLines]),
+      [
+        ['source_code', 'test/shipping.test.ts', undefined],
+        ['source_code', 'src/shipping.ts', [9]],
+        ['command_output', 'npm test', undefined],
+      ],
+    );
+    assert.ok(state.evidence.some((item) => item.id === hit), 'the hit was collected');
+    assert.ok(!userText(sends[0]!.command).includes(hit), 'but is not offered for citation');
+    assert.equal(state.patchProposals.at(-1)?.status, 'awaiting_verification');
+  });
+
   it('repairs the shipping incident from the rendered prompt alone, in one request that names no host path', async () => {
     const realGit = await resolveGitExecutable();
     const fixture = await createGitRepositoryFixture(realGit, SHIPPING_ROOT);
@@ -299,8 +329,8 @@ describe('the Bedrock model client against a local Converse runtime', () => {
       readonly run: string;
       readonly hit: string;
     }
-    const cases: Array<[string, (ids: ShippingIds) => { support: string[]; path: string }, 'edit_source_not_cited' | 'edit_path_unknown' | 'accepted', boolean?]> = [
-      ['A: cites the search hit for src/shipping.ts, not the file read', (ids) => ({ support: [ids.test, ids.run, ids.hit], path: 'src/shipping.ts' }), 'edit_source_not_cited', true],
+    const cases: Array<[string, (ids: ShippingIds) => { support: string[]; path: string }, 'model_error' | 'edit_source_not_cited' | 'edit_path_unknown' | 'accepted', boolean?]> = [
+      ['A: cites the search hit folded into src/shipping.ts, which was never sent', (ids) => ({ support: [ids.test, ids.run, ids.hit], path: 'src/shipping.ts' }), 'model_error'],
       ['B: cites only the test file and the test run', (ids) => ({ support: [ids.test, ids.run], path: 'src/shipping.ts' }), 'edit_source_not_cited', false],
       ['C: path written ./src/shipping.ts', (ids) => ({ support: [ids.src, ids.test, ids.run], path: './src/shipping.ts' }), 'edit_path_unknown', false],
       ['D: path written shipping.ts', (ids) => ({ support: [ids.src, ids.test, ids.run], path: 'shipping.ts' }), 'edit_path_unknown', false],
@@ -310,10 +340,11 @@ describe('the Bedrock model client against a local Converse runtime', () => {
 
     for (const [name, choose, expected, citedSearchResult] of cases) {
       it(`${name}: ${expected}`, async () => {
+        const hit = await shippingHitId();
         const { runtime, sends } = fakeRuntime((command) => {
           const evidence = promptData(command).evidence;
           const idOf = (kind: string, file?: string) => evidence.find((item) => item.kind === kind && (file === undefined || item.location.path === file))?.id ?? '';
-          const ids = { src: idOf('source_code', 'src/shipping.ts'), test: idOf('source_code', 'test/shipping.test.ts'), run: idOf('command_output'), hit: idOf('search_result') };
+          const ids = { src: idOf('source_code', 'src/shipping.ts'), test: idOf('source_code', 'test/shipping.test.ts'), run: idOf('command_output'), hit };
           const line = evidence.find((item) => item.id === ids.src)?.lines?.find(([, text]) => text === SHIPPING_BUGGY_LINE)?.[0] ?? 0;
           const { support, path: editPath } = choose(ids);
           return converseOutput(
@@ -334,7 +365,7 @@ describe('the Bedrock model client against a local Converse runtime', () => {
         } else {
           assert.deepEqual(
             events.map((event) => event.type === 'fallback' && [event.reason, event.stage, event.citedSearchResultAtEditPath]),
-            [['invalid_output', expected, citedSearchResult]],
+            [expected === 'model_error' ? ['model_error', undefined, undefined] : ['invalid_output', expected, citedSearchResult]],
           );
           assert.deepEqual(state.patchProposals, []);
           assert.deepEqual(state.hypotheses, [], 'the rule outcome stands');

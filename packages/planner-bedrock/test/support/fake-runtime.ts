@@ -10,6 +10,7 @@ export interface PromptEvidenceData {
   readonly lines?: Array<[number, string]>;
   readonly content?: string;
   readonly truncated?: true;
+  readonly matchedLines?: number[];
 }
 
 export interface PromptData {

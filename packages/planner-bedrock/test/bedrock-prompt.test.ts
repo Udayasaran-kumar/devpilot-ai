@@ -262,23 +262,124 @@ describe('renderEscalationPrompt', () => {
     assert.ok((selected.supportingEvidenceIds as readonly string[]).includes('ev-edited-source-code-id'), 'the example cites the edited file as support');
   });
 
-  it('sends "lines" only for the source file when a search hit shares its path', () => {
-    const hit: EscalationEvidence = {
-      id: 'ev-hit',
+  describe('search hits that repeat a line of a source item sent', () => {
+    const hitAt = (id: string, filePath: string, line: number, text: string, endLine = line): EscalationEvidence => ({
+      id,
       kind: 'search_result',
-      summary: 'src/quote.ts:2 contains "b"',
-      location: { type: 'file', path: 'src/quote.ts', startLine: 2, endLine: 2 },
-      content: 'b',
-    };
-    const data = dataOf(renderEscalationPrompt(requestOf([hit, source('ev-src', 'src/quote.ts', 'a\nb')])));
-    const atPath = data.evidence.filter((item) => item.location.path === 'src/quote.ts');
-    assert.deepEqual(
-      atPath.map((item) => [item.id, item.kind, item.lines !== undefined]),
-      [
-        ['ev-src', 'source_code', true],
-        ['ev-hit', 'search_result', false],
-      ],
-    );
+      summary: `${filePath}:${line} contains "b"`,
+      location: { type: 'file', path: filePath, startLine: line, endLine },
+      content: text,
+    });
+    const quote = source('ev-src', 'src/quote.ts', 'a\n  b\nc');
+
+    it('are sent only as matchedLines of that source item, so a reply cannot cite them', () => {
+      const prompt = renderEscalationPrompt(requestOf([hitAt('ev-hit', 'src/quote.ts', 2, '  b'), quote, output('ev-run', 'out')]));
+      const data = dataOf(prompt);
+      assert.deepEqual(
+        data.evidence.map((item) => [item.id, item.matchedLines]),
+        [
+          ['ev-src', [2]],
+          ['ev-run', undefined],
+        ],
+      );
+      assert.deepEqual(data.evidence[0]?.lines, [
+        [1, 'a'],
+        [2, '  b'],
+        [3, 'c'],
+      ]);
+      assert.deepEqual(prompt.sentEvidenceIds, ['ev-src', 'ev-run']);
+      assert.deepEqual(prompt.foldedEvidenceIds, ['ev-hit']);
+      assert.deepEqual(prompt.omittedEvidenceIds, []);
+      assert.ok(!prompt.user.includes('ev-hit'));
+    });
+
+    it('list each line once and in order, deterministically, across several searches', () => {
+      const request = requestOf([hitAt('ev-hit-3', 'src/quote.ts', 3, 'c'), hitAt('ev-hit-1', 'src/quote.ts', 1, 'a'), hitAt('ev-hit-3b', 'src/quote.ts', 3, 'c'), quote]);
+      const prompt = renderEscalationPrompt(request);
+      assert.deepEqual(dataOf(prompt).evidence[0]?.matchedLines, [1, 3]);
+      assert.deepEqual(prompt.foldedEvidenceIds, ['ev-hit-3', 'ev-hit-1', 'ev-hit-3b']);
+      assert.deepEqual(prompt.sentEvidenceIds, ['ev-src']);
+      assert.deepEqual(renderEscalationPrompt(request), renderEscalationPrompt(structuredClone(request)));
+    });
+
+    it('are folded without exposing redacted text', () => {
+      const line = 'const key = "AKIAABCDEFGHIJKLMNOP";';
+      const prompt = renderEscalationPrompt(requestOf([hitAt('ev-hit', 'src/config.ts', 2, line), source('ev-src', 'src/config.ts', `a\n${line}`)]));
+      assert.deepEqual(prompt.foldedEvidenceIds, ['ev-hit']);
+      assert.deepEqual(dataOf(prompt).evidence[0]?.lines?.[1], [2, 'const key = "<redacted>";']);
+      assert.ok(!prompt.user.includes('AKIAABCDEFGHIJKLMNOP'));
+    });
+
+    it('stay items of their own unless a source item sent shows exactly their line', () => {
+      const cases: Array<[string, EscalationEvidence[]]> = [
+        ['the file was not read', [hitAt('ev-hit', 'src/other.ts', 2, '  b'), quote]],
+        ['the path differs only by a "./" prefix', [hitAt('ev-hit', './src/quote.ts', 2, '  b'), quote]],
+        ['the text differs only in leading whitespace', [hitAt('ev-hit', 'src/quote.ts', 2, 'b'), quote]],
+        ['the same text is on another line', [hitAt('ev-hit', 'src/quote.ts', 3, '  b'), quote]],
+        ['the read covers other lines of the file', [hitAt('ev-hit', 'src/quote.ts', 2, '  b'), source('ev-src', 'src/quote.ts', '  b\nc', 10)]],
+        ['the hit spans several lines', [hitAt('ev-hit', 'src/quote.ts', 2, '  b', 3), quote]],
+        ['the hit has no line number', [{ ...hitAt('ev-hit', 'src/quote.ts', 2, '  b'), location: { type: 'file', path: 'src/quote.ts' } }, quote]],
+        ['the line is in command output, not a source file', [hitAt('ev-hit', 'src/quote.ts', 2, '  b'), output('ev-run', 'a\n  b')]],
+      ];
+      for (const [name, evidence] of cases) {
+        const prompt = renderEscalationPrompt(requestOf(evidence));
+        const data = dataOf(prompt);
+        assert.ok(prompt.sentEvidenceIds.includes('ev-hit'), name);
+        assert.deepEqual(prompt.foldedEvidenceIds, [], name);
+        assert.ok(data.evidence.every((item) => item.matchedLines === undefined), name);
+        assert.equal(data.evidence.find((item) => item.id === 'ev-hit')?.kind, 'search_result', name);
+      }
+    });
+
+    it('stay items of their own when their line was cut off by the planner or left out by the item limit', () => {
+      const line = (index: number) => `// line ${index} /Users/someone/${'x'.repeat(80)}`;
+      const cut = Array.from({ length: 200 }, (_, index) => line(index)).join('\n').slice(0, MAX_ESCALATION_CONTENT_LENGTH);
+      const cutLines = cut.split('\n');
+      const lastSent = cutLines.length - 1;
+      const planner = renderEscalationPrompt(
+        requestOf([
+          source('ev-src', 'src/long.ts', cut),
+          hitAt('ev-partial', 'src/long.ts', lastSent + 1, cutLines.at(-1) ?? ''),
+          hitAt('ev-last', 'src/long.ts', lastSent, cutLines[lastSent - 1] ?? ''),
+        ]),
+      );
+      assert.deepEqual(planner.foldedEvidenceIds, ['ev-last'], 'the last line sent folds; the cut line does not');
+      assert.ok(planner.sentEvidenceIds.includes('ev-partial'));
+
+      const fileLines = Array.from({ length: 1000 }, (_, index) => `const value${index} = ${index};`);
+      const limited = renderEscalationPrompt(
+        requestOf([source('ev-big', 'src/big.ts', fileLines.join('\n')), hitAt('ev-early', 'src/big.ts', 2, fileLines[1] ?? ''), hitAt('ev-late', 'src/big.ts', 900, fileLines[899] ?? '')]),
+      );
+      assert.equal(dataOf(limited).evidence[0]?.truncated, true);
+      assert.deepEqual(limited.foldedEvidenceIds, ['ev-early']);
+      assert.ok(limited.sentEvidenceIds.includes('ev-late'), 'line 900 is beyond the lines sent');
+    });
+
+    it('are folded only if the matched line still fits the evidence budget', () => {
+      const filler = (index: number) =>
+        source(`ev-fill-${index}`, `src/fill-${index}.ts`, Array.from({ length: 400 }, (_, line) => `// fill ${index}, line ${line} ${'x'.repeat(20)}`).join('\n'));
+      const evidenceWith = (padding: number) => [filler(0), filler(1), filler(2), quote, output('ev-pad', 'x'.repeat(padding)), hitAt('ev-hit', 'src/quote.ts', 2, '  b')];
+      /** The renderer's accounting: each item's JSON plus one separator. */
+      const used = (prompt: EscalationPrompt) => dataOf(prompt).evidence.reduce((total, item) => total + JSON.stringify(item).length + 1, 0);
+      const room = MAX_PROMPT_EVIDENCE_CHARS - used(renderEscalationPrompt(requestOf(evidenceWith(0).slice(0, -1))));
+      const growth = ',"matchedLines":[2]'.length;
+      assert.ok(room > growth && room - growth <= MAX_PROMPT_ITEM_CHARS, `room for ${room} characters`);
+
+      const fits = renderEscalationPrompt(requestOf(evidenceWith(room - growth)));
+      assert.deepEqual(fits.foldedEvidenceIds, ['ev-hit']);
+      assert.deepEqual(fits.omittedEvidenceIds, []);
+      assert.equal(used(fits), MAX_PROMPT_EVIDENCE_CHARS, 'the fold uses exactly the room left');
+
+      const full = renderEscalationPrompt(requestOf(evidenceWith(room - growth + 1)));
+      assert.deepEqual(full.foldedEvidenceIds, []);
+      assert.deepEqual(full.omittedEvidenceIds, ['ev-hit'], 'a hit that cannot be folded is sent or left out as before');
+      assert.equal(dataOf(full).evidence.find((item) => item.id === 'ev-src')?.matchedLines, undefined);
+      assert.ok(used(full) <= MAX_PROMPT_EVIDENCE_CHARS);
+      assert.deepEqual(
+        [...full.sentEvidenceIds, ...full.omittedEvidenceIds, ...full.foldedEvidenceIds].sort(),
+        evidenceWith(0).map((item) => item.id).sort(),
+      );
+    });
   });
 
   it('shows an example reply that the planner schema accepts, with both lists on every hypothesis', () => {
