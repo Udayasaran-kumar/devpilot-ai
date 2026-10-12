@@ -246,7 +246,8 @@ describe('renderEscalationPrompt', () => {
 
   it('asks for distinct causes cited for and against, and states the selection rule DevPilot applies', () => {
     const rules = [
-      '- Each hypothesis must describe a distinct possible cause, not a rewording of another. Include a rival only when the evidence supports a genuinely different explanation; one hypothesis is acceptable.',
+      '- Each hypothesis must describe a distinct possible cause, not a rewording of another. Do not include a rival merely because it is a possible explanation.',
+      'Include a rival only when the available evidence provides a concrete reason to consider that distinct cause. If no evidence supports a genuinely distinct alternative, return one well-supported hypothesis rather than speculative rivals.',
       '- For each hypothesis, cite evidence that supports it in "supportingEvidenceIds" and evidence that weighs against it in "contradictingEvidenceIds".',
       'The same evidence item may support one hypothesis and contradict another, but never both for the same hypothesis.',
       '- DevPilot scores hypotheses using their cited evidence. Selection requires at least 2 supporting ids, more supporting than contradicting ids, a confidence of at least 0.6, and a strictly higher confidence than every rival.',
@@ -259,6 +260,21 @@ describe('renderEscalationPrompt', () => {
     assert.ok(!SYSTEM_PROMPT.includes('Cite every item that supports it'), 'the instruction to cite everything for every hypothesis is gone');
     assert.ok(!SYSTEM_PROMPT.includes('more support than every other hypothesis'), 'the inexact selection rule is gone');
     assert.ok(SYSTEM_PROMPT.includes('- Cite only ids of items in "evidence", at most 8 per list. Never cite one id as both supporting and contradicting.'));
+  });
+
+  it('includes a rival only for a concrete evidential reason, and prefers one well-supported hypothesis to speculative rivals', () => {
+    const guidance = [
+      'Do not include a rival merely because it is a possible explanation.',
+      'Include a rival only when the available evidence provides a concrete reason to consider that distinct cause.',
+      'If no evidence supports a genuinely distinct alternative, return one well-supported hypothesis rather than speculative rivals.',
+    ];
+    const positions = guidance.map((sentence) => SYSTEM_PROMPT.indexOf(sentence));
+    assert.ok(positions.every((position) => position >= 0), 'every sentence is present');
+    assert.deepEqual(positions, [...positions].sort((a, b) => a - b), 'the sentences appear in order');
+    assert.ok(SYSTEM_PROMPT.indexOf('- Each hypothesis must describe a distinct possible cause') < Math.min(...positions), 'they extend the distinct-cause rule');
+    assert.ok(Math.max(...positions) < SYSTEM_PROMPT.indexOf('- edit is null'), 'before the edit instructions');
+    assert.ok(!SYSTEM_PROMPT.includes('Include a rival only when the evidence supports a genuinely different explanation'), 'the weaker rival rule is replaced, not repeated');
+    assert.ok(!SYSTEM_PROMPT.includes('one hypothesis is acceptable'), 'the single-hypothesis allowance is stated once');
   });
 
   it('separates the symptom from causes, and shared evidence from evidence that tells hypotheses apart', () => {
@@ -315,8 +331,15 @@ describe('renderEscalationPrompt', () => {
       actions: [],
       evidence: [
         item('ev-edited-source-code-id', 'source_code', 'src/item.ts'),
-        item('ev-other-supporting-id', 'source_code', 'test/item.test.ts'),
-        item('ev-contradicting-id', 'source_code', 'src/other.ts'),
+        {
+          id: 'ev-failure-output-id',
+          kind: 'command_output',
+          summary: '`npm test` exited 1',
+          content: 'not ok 1',
+          location: { type: 'command', command: 'npm test', exitCode: 1 },
+          source: { tool: 'run_command', actionId: 'action-run' },
+          collectedAt: at,
+        },
       ],
       hypotheses: [],
       verifications: [],
@@ -478,9 +501,22 @@ describe('renderEscalationPrompt', () => {
     for (const hypothesis of parsed.hypotheses) {
       assert.ok(Array.isArray(hypothesis.supportingEvidenceIds) && Array.isArray(hypothesis.contradictingEvidenceIds));
     }
-    assert.ok(parsed.hypotheses.some((item) => item.supportingEvidenceIds.length === 0), 'an empty supporting list is shown as []');
-    assert.ok(parsed.hypotheses.some((item) => item.contradictingEvidenceIds.length === 0), 'an empty contradicting list is shown as []');
+    assert.deepEqual(parsed.hypotheses.map((item) => item.contradictingEvidenceIds), [[]], 'an empty list is shown as []');
     assert.equal(parsed.edit?.hypothesisKey, parsed.hypotheses[0]?.key);
+  });
+
+  it('shows one hypothesis whose edit names it and cites the edited source as support, and states that rule', () => {
+    const parsed = ModelAssessmentSchema.parse(structuredClone(REPLY_EXAMPLE));
+    assert.equal(parsed.hypotheses.length, 1);
+    const named = parsed.hypotheses.find((item) => item.key === parsed.edit?.hypothesisKey);
+    assert.ok(named, 'the edit names a hypothesis of the example');
+    assert.ok(named.supportingEvidenceIds.includes('ev-edited-source-code-id'), 'that hypothesis cites the edited source item as support');
+    assert.deepEqual(named.contradictingEvidenceIds, []);
+    assert.ok(
+      SYSTEM_PROMPT.includes(
+        '- The "id" of the "source_code" item whose line you edit must appear in "supportingEvidenceIds" of the hypothesis named by edit.hypothesisKey. If you are unsure whether a second hypothesis is justified, return only one.',
+      ),
+    );
   });
 
   it('the schema still refuses a hypothesis whose evidence list is missing, null, or a string', () => {

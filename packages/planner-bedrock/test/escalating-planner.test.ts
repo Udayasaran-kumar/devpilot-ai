@@ -415,6 +415,7 @@ describe('EscalatingPlanner: invalid model output leaves the rule decision uncha
       const selectionStage = stage === 'no_supported_hypothesis' || stage === 'below_selection_threshold' || stage === 'no_exclusive_winner';
       assert.equal(event?.type === 'fallback' && 'selectionDiagnostics' in event, selectionStage, 'selection diagnostics accompany selection refusals only');
       assert.equal(event?.type === 'fallback' && 'editPresent' in event, selectionStage, 'editPresent accompanies selection refusals only');
+      assert.equal(event?.type === 'fallback' && 'tieDiagnostics' in event, stage === 'no_exclusive_winner', 'tie diagnostics accompany no_exclusive_winner refusals only');
       for (const field of ['editSourceCitedAs', 'editSourceCitedByRival', 'editTargetsSignalTest']) {
         assert.equal(event?.type === 'fallback' && field in event, stage === 'edit_source_not_cited', `${field} accompanies edit_source_not_cited refusals only`);
       }
@@ -592,6 +593,28 @@ describe('EscalatingPlanner: selection by the confidence that cited evidence cou
     edit,
   });
   const diagnostic = (supportingCount: number, contradictingCount: number, computedConfidence: number) => ({ supportingCount, contradictingCount, computedConfidence });
+  const tie = (tiedCount: number, sharedSupportingCount: number, identicalCitations: boolean, sharedFailureOutput: boolean) => ({
+    tiedCount,
+    sharedSupportingCount,
+    identicalCitations,
+    sharedFailureOutput,
+  });
+  /** Records the `npm test` run that produced `ev-run`, so that item is identified as the failure output. */
+  const reproduced = () =>
+    contextFor('inv-1', {
+      actions: [
+        {
+          id: 'action-1',
+          tool: 'run_command',
+          input: { command: 'npm', args: ['test'] },
+          rationale: 'Reproduce the failure.',
+          expectedEvidence: 'The failing test output.',
+          hypothesisIds: [],
+          status: 'completed',
+          resultingEvidenceIds: ['ev-run'],
+        },
+      ],
+    });
 
   const selectedCases: Array<[string, readonly Counts[], number]> = [
     ['a clear winner: 3/0 against 0/1', [[ALL, []], [[], ['ev-test']]], 0.75],
@@ -617,36 +640,84 @@ describe('EscalatingPlanner: selection by the confidence that cited evidence cou
     });
   }
 
-  const refusedCases: Array<[string, readonly Counts[], ModelAssessment['edit'], RefusalStage, ReturnType<typeof diagnostic>[]]> = [
-    ['a two-way tie: 3/0 and 3/0', [[ALL, []], [ALL, []]], VALID_REPLY.edit, 'no_exclusive_winner', [diagnostic(3, 0, 0.75), diagnostic(3, 0, 0.75)]],
-    ['a two-way tie on different evidence: 2/0 and 2/0, no edit', [[['ev-src', 'ev-run'], []], [['ev-test', 'ev-run'], []]], null, 'no_exclusive_winner', [diagnostic(2, 0, 0.66), diagnostic(2, 0, 0.66)]],
+  const refusedCases: Array<[string, readonly Counts[], ModelAssessment['edit'], RefusalStage, ReturnType<typeof diagnostic>[], ReturnType<typeof tie>?]> = [
+    ['a two-way tie: 3/0 and 3/0', [[ALL, []], [ALL, []]], VALID_REPLY.edit, 'no_exclusive_winner', [diagnostic(3, 0, 0.75), diagnostic(3, 0, 0.75)], tie(2, 3, true, true)],
+    [
+      'a two-way tie on different evidence: 2/0 and 2/0, no edit',
+      [[['ev-src', 'ev-run'], []], [['ev-test', 'ev-run'], []]],
+      null,
+      'no_exclusive_winner',
+      [diagnostic(2, 0, 0.66), diagnostic(2, 0, 0.66)],
+      tie(2, 1, false, true),
+    ],
+    [
+      'a two-way tie sharing a source but not the failure output: 2/0 and 2/0',
+      [[['ev-src', 'ev-test'], []], [['ev-test', 'ev-run'], []]],
+      VALID_REPLY.edit,
+      'no_exclusive_winner',
+      [diagnostic(2, 0, 0.66), diagnostic(2, 0, 0.66)],
+      tie(2, 1, false, false),
+    ],
     [
       'a three-way tie at the top: 3/0, 3/0, and 1/0',
       [[ALL, []], [ALL, []], [['ev-run'], []]],
       VALID_REPLY.edit,
       'no_exclusive_winner',
       [diagnostic(3, 0, 0.75), diagnostic(3, 0, 0.75), diagnostic(1, 0, 0.5)],
+      tie(2, 3, true, true),
     ],
-    ['three supported equally: 2/0, 2/0, and 2/0', [[['ev-src', 'ev-run'], []], [['ev-test', 'ev-run'], []], [['ev-src', 'ev-test'], []]], VALID_REPLY.edit, 'no_exclusive_winner', [diagnostic(2, 0, 0.66), diagnostic(2, 0, 0.66), diagnostic(2, 0, 0.66)]],
+    [
+      'a two-way tie beside a weakened hypothesis citing the same support: 2/0, 2/0, and 2/2',
+      [[['ev-src', 'ev-run'], []], [['ev-src', 'ev-run'], []], [['ev-src', 'ev-run'], ['ev-test', 'ev-hit']]],
+      VALID_REPLY.edit,
+      'no_exclusive_winner',
+      [diagnostic(2, 0, 0.66), diagnostic(2, 0, 0.66), diagnostic(2, 2, 0.4)],
+      tie(2, 2, true, true),
+    ],
+    [
+      'three supported equally: 2/0, 2/0, and 2/0',
+      [[['ev-src', 'ev-run'], []], [['ev-test', 'ev-run'], []], [['ev-src', 'ev-test'], []]],
+      VALID_REPLY.edit,
+      'no_exclusive_winner',
+      [diagnostic(2, 0, 0.66), diagnostic(2, 0, 0.66), diagnostic(2, 0, 0.66)],
+      tie(3, 0, false, false),
+    ],
     ['too little support: 1/0', [[['ev-src'], []]], VALID_REPLY.edit, 'below_selection_threshold', [diagnostic(1, 0, 0.5)]],
     ['too little support twice: 1/0 and 1/0', [[['ev-src'], []], [['ev-test'], []]], VALID_REPLY.edit, 'below_selection_threshold', [diagnostic(1, 0, 0.5), diagnostic(1, 0, 0.5)]],
+    ['only the failure output, twice: 1/0 and 1/0', [[['ev-run'], []], [['ev-run'], []]], VALID_REPLY.edit, 'below_selection_threshold', [diagnostic(1, 0, 0.5), diagnostic(1, 0, 0.5)]],
     ['no support: 0/0', [[[], []]], VALID_REPLY.edit, 'no_supported_hypothesis', [diagnostic(0, 0, 0)]],
     ['no hypothesis with more support than contradiction: 0/1 and 1/1', [[[], ['ev-src']], [['ev-src'], ['ev-test']]], null, 'no_supported_hypothesis', [diagnostic(0, 1, 0), diagnostic(1, 1, 0.33)]],
   ];
-  for (const [name, counts, edit, stage, diagnostics] of refusedCases) {
+  for (const [name, counts, edit, stage, diagnostics, tieDiagnostics] of refusedCases) {
     it(`refuses ${name} (${stage}), reporting each hypothesis's counts and confidence in reply order`, async () => {
       const { planner, rules, events } = setup(replyOf(counts, edit));
-      assert.deepEqual(await planner.next(contextFor()), RULE_FINISH);
+      assert.deepEqual(await planner.next(reproduced()), RULE_FINISH);
       assert.equal(rules.seen.length, 1);
       assert.equal(events.length, 1);
       const [event] = events;
       assert.ok(event?.type === 'fallback');
       const { detail: _detail, ...rest } = event;
-      assert.deepEqual(rest, { type: 'fallback', investigationId: 'inv-1', reason: 'invalid_output', stage, selectionDiagnostics: diagnostics, editPresent: edit !== null });
+      assert.deepEqual(rest, {
+        type: 'fallback',
+        investigationId: 'inv-1',
+        reason: 'invalid_output',
+        stage,
+        selectionDiagnostics: diagnostics,
+        editPresent: edit !== null,
+        ...(tieDiagnostics ? { tieDiagnostics } : {}),
+      });
     });
   }
 
-  it('reports numbers and a boolean only, never keys, statements, evidence IDs, or other reply text', async () => {
+  it('reports shared failure output only for the recorded run of the signal command, not for any command output', async () => {
+    const { planner, events } = setup(replyOf([[ALL, []], [ALL, []]]));
+    await planner.next(contextFor());
+    const [event] = events;
+    assert.ok(event?.type === 'fallback' && event.stage === 'no_exclusive_winner');
+    assert.deepEqual(event.tieDiagnostics, tie(2, 3, true, false));
+  });
+
+  it('reports numbers and booleans only, never keys, statements, evidence IDs, or other reply text', async () => {
     const MARKER = 'marker-5b7u';
     const reply = {
       hypotheses: [
@@ -656,7 +727,7 @@ describe('EscalatingPlanner: selection by the confidence that cited evidence cou
       edit: { ...VALID_REPLY.edit, hypothesisKey: MARKER },
     };
     const { planner, events } = setup(reply);
-    await planner.next(contextFor());
+    await planner.next(reproduced());
     const [event] = events;
     assert.ok(event?.type === 'fallback' && event.stage === 'no_exclusive_winner');
     assert.ok(event.selectionDiagnostics);
@@ -665,6 +736,11 @@ describe('EscalatingPlanner: selection by the confidence that cited evidence cou
       assert.ok(Object.values(item).every((value) => typeof value === 'number' && Number.isFinite(value)));
     }
     assert.equal(typeof event.editPresent, 'boolean');
+    assert.ok(event.tieDiagnostics);
+    assert.deepEqual(Object.keys(event.tieDiagnostics), ['tiedCount', 'sharedSupportingCount', 'identicalCitations', 'sharedFailureOutput']);
+    assert.ok(Number.isInteger(event.tieDiagnostics.tiedCount) && Number.isInteger(event.tieDiagnostics.sharedSupportingCount));
+    assert.equal(typeof event.tieDiagnostics.identicalCitations, 'boolean');
+    assert.equal(typeof event.tieDiagnostics.sharedFailureOutput, 'boolean');
     const { detail: _detail, ...safe } = event;
     const text = JSON.stringify(safe);
     assert.ok(!text.includes(MARKER), 'no key or statement');

@@ -88,6 +88,20 @@ export interface SelectionDiagnostic {
   readonly computedConfidence: number;
 }
 
+/**
+ * The hypotheses tied at the top confidence, described by their citations alone. It cannot say
+ * whether they name the same cause: statements are not compared, and a reply edits for one hypothesis only.
+ */
+export interface TieDiagnostic {
+  readonly tiedCount: number;
+  /** Supporting evidence items every tied hypothesis cites. */
+  readonly sharedSupportingCount: number;
+  /** Whether every tied hypothesis cites exactly the same supporting and contradicting items. */
+  readonly identicalCitations: boolean;
+  /** Whether the shared supporting items include the output of the run that reproduced the failure, which every cause explains. */
+  readonly sharedFailureOutput: boolean;
+}
+
 /** How a hypothesis cites the source read at the edit's path: `supporting` if it supports any such item, else `contradicting` if it contradicts one, else `none`. */
 export type EditSourceCitation = 'supporting' | 'contradicting' | 'none';
 
@@ -106,6 +120,8 @@ export type EscalationPlanResult =
       readonly selectionDiagnostics?: readonly SelectionDiagnostic[];
       /** For the same refusals: whether the reply proposed an edit. */
       readonly editPresent?: boolean;
+      /** For `no_exclusive_winner`: how the tied hypotheses' citations relate. */
+      readonly tieDiagnostics?: TieDiagnostic;
       /** For `edit_source_not_cited`: how the selected hypothesis cites the source read at exactly the edit's path. */
       readonly editSourceCitedAs?: EditSourceCitation;
       /** For `edit_source_not_cited`: the strongest citation of that source by any other hypothesis (`supporting`, then `contradicting`, then `none`). */
@@ -165,10 +181,12 @@ export function planEscalation(context: PlannerContext, reply: unknown): Escalat
 
   const selected = chooseHypothesis(assessed);
   if (!selected) {
+    const stage = selectionFailure(assessed);
     return {
-      ...refuse(selectionFailure(assessed), 'No model hypothesis is supported well enough by the cited evidence to be selected.'),
+      ...refuse(stage, 'No model hypothesis is supported well enough by the cited evidence to be selected.'),
       selectionDiagnostics: assessed.map(selectionDiagnostic),
       editPresent: assessment.edit !== null,
+      ...(stage === 'no_exclusive_winner' ? { tieDiagnostics: tieDiagnostic(context, assessed) } : {}),
     };
   }
 
@@ -358,6 +376,24 @@ function selectionFailure(assessed: readonly Hypothesis[]): RefusalStage {
   const best = supported.reduce<Hypothesis | undefined>((top, item) => (top === undefined || item.confidence > top.confidence ? item : top), undefined);
   if (!best) return 'no_supported_hypothesis';
   return HypothesisSchema.safeParse({ ...best, status: 'selected' }).success ? 'no_exclusive_winner' : 'below_selection_threshold';
+}
+
+/** At `no_exclusive_winner` the best supported hypothesis and every supported rival as confident share the top confidence. */
+function tieDiagnostic(context: PlannerContext, assessed: readonly Hypothesis[]): TieDiagnostic {
+  const supported = assessed.filter((item) => item.status === 'supported');
+  const top = Math.max(...supported.map((item) => item.confidence));
+  const tied = supported.filter((item) => item.confidence === top);
+  const citations = tied.map((item) => ({ supporting: new Set(item.supportingEvidenceIds), contradicting: new Set(item.contradictingEvidenceIds) }));
+  const [first, ...others] = citations;
+  const shared = [...(first?.supporting ?? [])].filter((id) => others.every((other) => other.supporting.has(id)));
+  const sameSet = (a: ReadonlySet<string>, b: ReadonlySet<string>) => a.size === b.size && [...a].every((id) => b.has(id));
+  const failureOutput = analyzeInvestigation(context).reproduction?.evidence?.id;
+  return {
+    tiedCount: tied.length,
+    sharedSupportingCount: shared.length,
+    identicalCitations: first !== undefined && others.every((other) => sameSet(other.supporting, first.supporting) && sameSet(other.contradicting, first.contradicting)),
+    sharedFailureOutput: failureOutput !== undefined && shared.includes(failureOutput),
+  };
 }
 
 function selectionDiagnostic(hypothesis: Hypothesis): SelectionDiagnostic {

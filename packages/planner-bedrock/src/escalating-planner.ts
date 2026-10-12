@@ -1,5 +1,5 @@
 import { RulePlanner, type Planner, type PlannerContext, type PlannerDecision } from '@devpilot/planners';
-import { planEscalation, type EditSourceCitation, type EscalationPlan, type RefusalStage, type SelectionDiagnostic } from './assessment.js';
+import { planEscalation, type EditSourceCitation, type EscalationPlan, type RefusalStage, type SelectionDiagnostic, type TieDiagnostic } from './assessment.js';
 import { ModelUnavailableError, type EscalationRequest, type ModelClient } from './model-client.js';
 
 export const DEFAULT_MODEL_TIMEOUT_MS = 30_000;
@@ -38,6 +38,8 @@ export type EscalationEvent =
       readonly selectionDiagnostics?: readonly SelectionDiagnostic[];
       /** For a selection refusal: whether the reply proposed an edit. Safe to log. */
       readonly editPresent?: boolean;
+      /** For a `no_exclusive_winner` refusal: counts and booleans relating the tied hypotheses' citations. Safe to log. */
+      readonly tieDiagnostics?: TieDiagnostic;
       /** For an `edit_source_not_cited` refusal: how the selected hypothesis cites the source read at the edit's path. Safe to log. */
       readonly editSourceCitedAs?: EditSourceCitation;
       /** For an `edit_source_not_cited` refusal: the strongest citation of that source by any other hypothesis. Safe to log. */
@@ -53,6 +55,7 @@ type FallbackDiagnostics = Pick<
   | 'citedSearchResultAtEditPath'
   | 'selectionDiagnostics'
   | 'editPresent'
+  | 'tieDiagnostics'
   | 'editSourceCitedAs'
   | 'editSourceCitedByRival'
   | 'editTargetsSignalTest'
@@ -168,6 +171,7 @@ export class EscalatingPlanner implements Planner {
         ...(result.citedSearchResultAtEditPath !== undefined ? { citedSearchResultAtEditPath: result.citedSearchResultAtEditPath } : {}),
         ...(result.selectionDiagnostics ? { selectionDiagnostics: result.selectionDiagnostics } : {}),
         ...(result.editPresent !== undefined ? { editPresent: result.editPresent } : {}),
+        ...(result.tieDiagnostics ? { tieDiagnostics: result.tieDiagnostics } : {}),
         ...(result.editSourceCitedAs ? { editSourceCitedAs: result.editSourceCitedAs } : {}),
         ...(result.editSourceCitedByRival ? { editSourceCitedByRival: result.editSourceCitedByRival } : {}),
         ...(result.editTargetsSignalTest !== undefined ? { editTargetsSignalTest: result.editTargetsSignalTest } : {}),

@@ -18,7 +18,8 @@
     "simulator": "tsx apps/alexa-simulator/src/server/main.ts",
     "test": "node --import tsx --test \"packages/*/test/**/*.test.ts\" \"apps/*/test/**/*.test.ts\" \"tests/**/*.test.ts\"",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p apps/alexa-simulator/tsconfig.json",
-    "check": "npm run typecheck && npm test"
+    "check": "npm run typecheck && npm test",
+    "host:bedrock": "tsx apps/devpilot-host/run.ts"
   },
   "devDependencies": {
     "@types/node": "^22.20.5",

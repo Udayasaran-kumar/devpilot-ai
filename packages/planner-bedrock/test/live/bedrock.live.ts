@@ -70,6 +70,12 @@ if (!model) {
                 .join(', ')}; editPresent: ${event.editPresent === true}`
             : ''
         }${
+          event.tieDiagnostics
+            ? `; tie (tied/shared supporting): ${Number(event.tieDiagnostics.tiedCount)}/${Number(event.tieDiagnostics.sharedSupportingCount)}; identicalCitations: ${
+                event.tieDiagnostics.identicalCitations === true
+              }; sharedFailureOutput: ${event.tieDiagnostics.sharedFailureOutput === true}`
+            : ''
+        }${
           event.editSourceCitedAs
             ? `; editSourceCitedAs: ${CITATIONS.has(event.editSourceCitedAs) ? event.editSourceCitedAs : 'unknown'}; editSourceCitedByRival: ${
                 event.editSourceCitedByRival && CITATIONS.has(event.editSourceCitedByRival) ? event.editSourceCitedByRival : 'unknown'

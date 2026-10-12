@@ -32,7 +32,7 @@ const PAYROLL_PACKAGE = JSON.stringify({
   name: 'payroll',
   private: true,
   type: 'module',
-  scripts: { test: 'node --experimental-strip-types --disable-warning=ExperimentalWarning --test test/payroll.test.ts' },
+  scripts: { test: 'node --experimental-strip-types --disable-warning=ExperimentalWarning --test --test-reporter=tap test/payroll.test.ts' },
 });
 const payrollSource = (rate: string, pensionBase: string) =>
   [

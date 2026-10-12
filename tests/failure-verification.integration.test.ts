@@ -436,7 +436,7 @@ describe('failure-specific verification: test files outside the patch policy\'s 
       [],
       'the path policy does not recognise this file as a test; the baseline failure identity does',
     );
-    const root = await createRepository('node --test', { 'src/math.mjs': BUGGY_ADD, 'src/math-test.mjs': mathTest('./math.mjs') });
+    const root = await createRepository('node --test --test-reporter=tap', { 'src/math.mjs': BUGGY_ADD, 'src/math-test.mjs': mathTest('./math.mjs') });
     const unchanged = await snapshotRepository(realGit, root);
     const acceptBug = patch('--- a/src/math-test.mjs', '+++ b/src/math-test.mjs', '@@ -10 +10 @@', '-  assert.equal(add(2, 3), 5);', '+  assert.equal(add(2, 3), 6);');
 
@@ -450,7 +450,7 @@ describe('failure-specific verification: test files outside the patch policy\'s 
   });
 
   it('a source patch that exits early stays inconclusive when the test file is run by absolute path', async () => {
-    const root = await createRepository('node --test "$PWD/test/math.test.mjs"', { 'src/math.mjs': BUGGY_ADD, 'test/math.test.mjs': mathTest('../src/math.mjs') });
+    const root = await createRepository('node --test --test-reporter=tap "$PWD/test/math.test.mjs"', { 'src/math.mjs': BUGGY_ADD, 'test/math.test.mjs': mathTest('../src/math.mjs') });
     const unchanged = await snapshotRepository(realGit, root);
     const exitOnImport = patch('--- a/src/math.mjs', '+++ b/src/math.mjs', '@@ -1 +1,2 @@', '+process.exit(0);', ' export const add = (a, b) => a * b;');
 

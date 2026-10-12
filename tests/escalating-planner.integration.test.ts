@@ -336,6 +336,7 @@ describe('the Bedrock model client against a local Converse runtime', () => {
         { supportingCount: 3, contradictingCount: 0, computedConfidence: 0.75 },
       ],
       editPresent: true,
+      tieDiagnostics: { tiedCount: 2, sharedSupportingCount: 3, identicalCitations: true, sharedFailureOutput: true },
     });
     const text = JSON.stringify(safe);
     assert.ok(!text.includes(MARKER) && !text.includes('ev-') && !text.includes('shipping'), 'numbers and fixed names only');
@@ -449,16 +450,24 @@ describe('the Bedrock model client against a local Converse runtime', () => {
       return { ...recorded, replies };
     };
 
-    const ties: Array<[string, Shape]> = [
+    const tieOf = (sharedSupportingCount: number, identicalCitations: boolean, sharedFailureOutput: boolean) => ({
+      tiedCount: 2,
+      sharedSupportingCount,
+      identicalCitations,
+      sharedFailureOutput,
+    });
+    const ties: Array<[string, Shape, ReturnType<typeof tieOf>]> = [
       [
         'E1: a rewording of the code bug, citing the same evidence',
         (ids) => [
           codeBug([ids.src, ids.run]),
           { key: 'threshold-excluded', statement: PARAPHRASE_STATEMENT, supportingEvidenceIds: [ids.src, ids.run], contradictingEvidenceIds: [] },
         ],
+        tieOf(2, true, true),
       ],
-      ['E2a: a distinct test-bug cause, citing the same evidence', (ids) => [codeBug([ids.src, ids.run]), testBug([ids.src, ids.run])]],
-      ['E2b: a distinct test-bug cause, citing overlapping evidence', (ids) => [codeBug([ids.src, ids.run]), testBug([ids.test, ids.run])]],
+      ['E2a: a distinct test-bug cause, citing the same evidence', (ids) => [codeBug([ids.src, ids.run]), testBug([ids.src, ids.run])], tieOf(2, true, true)],
+      ['E2b: a distinct test-bug cause, sharing only the failure output', (ids) => [codeBug([ids.src, ids.run]), testBug([ids.test, ids.run])], tieOf(1, false, true)],
+      ['E2c: a distinct test-bug cause, sharing only the failing test', (ids) => [codeBug([ids.src, ids.test]), testBug([ids.test, ids.run])], tieOf(1, false, false)],
     ];
 
     let rulesLog: Promise<string> | undefined;
@@ -481,7 +490,7 @@ describe('the Bedrock model client against a local Converse runtime', () => {
       return run;
     };
 
-    for (const [name, shape] of ties) {
+    for (const [name, shape, tieDiagnostics] of ties) {
       it(`${name}: refused at no_exclusive_winner with 2/0 versus 2/0, proposing nothing`, async () => {
         const run = await tie(name, shape);
         assert.equal(run.sends, 1);
@@ -496,6 +505,7 @@ describe('the Bedrock model client against a local Converse runtime', () => {
           stage: 'no_exclusive_winner',
           selectionDiagnostics: [TWO_SUPPORTING, TWO_SUPPORTING],
           editPresent: true,
+          tieDiagnostics,
         });
         const text = JSON.stringify(safe);
         for (const forbidden of ['ev-', 'shipping', 'threshold', SHIPPING_BUGGY_LINE.trim()]) {
@@ -507,9 +517,10 @@ describe('the Bedrock model client against a local Converse runtime', () => {
       });
     }
 
-    it('E1, E2a, and E2b send different replies but emit the same refusal event apart from detail', async () => {
-      const runs = await Promise.all(ties.map(([name, shape]) => tie(name, shape)));
-      assert.equal(new Set(runs.map((run) => run.replies.join('\n'))).size, ties.length, 'the replies differ');
+    it('E1 and E2a send different replies but emit the same refusal event apart from detail: a rewording and a distinct cause on the same evidence look alike', async () => {
+      const sameEvidence = ties.slice(0, 2);
+      const runs = await Promise.all(sameEvidence.map(([name, shape]) => tie(name, shape)));
+      assert.equal(new Set(runs.map((run) => run.replies.join('\n'))).size, sameEvidence.length, 'the replies differ');
       const emitted = runs.map((run) =>
         run.events.map((event) => {
           assert.ok(event.type === 'fallback');
@@ -521,7 +532,26 @@ describe('the Bedrock model client against a local Converse runtime', () => {
         emitted[0]?.map((event) => event.stage),
         ['no_exclusive_winner'],
       );
-      for (const events of emitted.slice(1)) assert.deepEqual(events, emitted[0]);
+      assert.deepEqual(emitted[1], emitted[0]);
+    });
+
+    it('E4: two hypotheses citing only the failure output are refused as insufficient evidence, with no tie diagnostics', async () => {
+      const run = await runTie((ids) => [codeBug([ids.run]), testBug([ids.run])]);
+      assert.equal(run.sends, 1);
+      const [event] = run.events;
+      assert.ok(event?.type === 'fallback');
+      const { detail: _detail, ...safe } = event;
+      const ONE_SUPPORTING = { supportingCount: 1, contradictingCount: 0, computedConfidence: 0.5 };
+      assert.deepEqual(safe, {
+        type: 'fallback',
+        investigationId: 'inv-escalation',
+        reason: 'invalid_output',
+        stage: 'below_selection_threshold',
+        selectionDiagnostics: [ONE_SUPPORTING, ONE_SUPPORTING],
+        editPresent: true,
+      });
+      assert.deepEqual(run.state.patchProposals, []);
+      assert.equal(run.log, await rulesOnly(), 'the rule outcome stands');
     });
 
     it('E3: the same counts with one genuine contradiction of the rival select the code bug and repair it', async () => {
