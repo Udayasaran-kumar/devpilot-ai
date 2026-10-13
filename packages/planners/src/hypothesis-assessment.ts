@@ -69,7 +69,7 @@ function nextActionReason(status: HypothesisStatus, candidate: HypothesisCandida
     case 'proposed':
       return 'No collected evidence bears on this hypothesis yet.';
     case 'supported':
-      return candidate.substitution
+      return candidate.substitution || candidate.operatorSubstitution
         ? 'Supported; eligible for selection if no competing hypothesis is as well supported.'
         : 'Supported, but no repair can be derived from the evidence for this kind of hypothesis.';
     case 'weakened':

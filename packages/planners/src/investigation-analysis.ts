@@ -11,17 +11,24 @@ import {
 import { evaluateArithmetic } from './analysis/arithmetic.js';
 import {
   assertionsIn,
+  enclosingFunction,
   findTestBlocks,
   isNumberLiteral,
+  isStraightLine,
   localsBefore,
   numberLines,
   numericConstants,
   parseAssertion,
+  parseBoundaryConditional,
   parseDeclaration,
+  parseLiteralCall,
+  replaceBinaryOperator,
   replaceIdentifier,
+  returnsLocalAs,
   valueIdentifiers,
   words,
   type Assertion,
+  type BoundaryOperator,
   type Declaration,
   type SourceLine,
   type TestBlock,
@@ -37,7 +44,7 @@ export interface Finding {
   readonly decisive?: boolean;
 }
 
-export type HypothesisKind = 'wrong_input' | 'upstream_value' | 'wrong_constant';
+export type HypothesisKind = 'wrong_input' | 'upstream_value' | 'wrong_constant' | 'wrong_operator';
 
 /** A candidate repair: replace `from` with `to` in the expression on `line` of `path`. */
 export interface IdentifierSubstitution {
@@ -47,6 +54,13 @@ export interface IdentifierSubstitution {
   readonly to: string;
 }
 
+export interface OperatorSubstitution {
+  readonly path: string;
+  readonly line: number;
+  readonly from: '>' | '>=' | '<' | '<=' | '===' | '!==';
+  readonly to: '>' | '>=' | '<' | '<=' | '===' | '!==';
+}
+
 export interface HypothesisCandidate {
   readonly id: string;
   readonly kind: HypothesisKind;
@@ -54,6 +68,7 @@ export interface HypothesisCandidate {
   readonly support: readonly Finding[];
   readonly contradiction: readonly Finding[];
   readonly substitution?: IdentifierSubstitution;
+  readonly operatorSubstitution?: OperatorSubstitution;
 }
 
 export interface Reproduction {
@@ -106,9 +121,14 @@ export interface InvestigationAnalysis {
   readonly candidates: readonly HypothesisCandidate[];
 }
 
+export interface AnalysisOptions {
+  /** Also form `wrong_operator` hypotheses at an exact comparison boundary (see `boundaryCandidates`). Off by default. */
+  readonly operatorBoundaries?: boolean;
+}
+
 const SHELL_SYNTAX = /[;&|<>`$(){}[\]*?!~"'\\]/;
 
-export function analyzeInvestigation(context: PlannerContext): InvestigationAnalysis {
+export function analyzeInvestigation(context: PlannerContext, options: AnalysisOptions = {}): InvestigationAnalysis {
   const commandLine = context.signal.command?.trim();
   if (!commandLine) return { commandProblem: 'The signal names no command that reproduces the failure.', candidates: [] };
   const [command, ...args] = commandLine.split(/\s+/);
@@ -138,7 +158,10 @@ export function analyzeInvestigation(context: PlannerContext): InvestigationAnal
     failingTest,
     definition,
     computation,
-    candidates: generateCandidates(reproduction, failingTest, definition.match, computation),
+    candidates: [
+      ...generateCandidates(reproduction, failingTest, definition.match, computation),
+      ...(options.operatorBoundaries === true ? boundaryCandidates(reproduction, failingTest, definition.match, computation) : []),
+    ],
   };
 }
 
@@ -379,6 +402,169 @@ function generateCandidates(
 function describeConstants(expression: string, computation: Computation): string {
   const used = computation.constants.filter((constant) => valueIdentifiers(expression).includes(constant.name));
   return used.map((constant) => ` and \`${constant.name}\` = ${constant.value}`).join('');
+}
+
+const BOUNDARY_TWIN: Readonly<Record<BoundaryOperator, BoundaryOperator>> = { '>': '>=', '>=': '>', '<': '<=', '<=': '<' };
+
+function holds(operator: BoundaryOperator, left: number, right: number): boolean {
+  switch (operator) {
+    case '>':
+      return left > right;
+    case '>=':
+      return left >= right;
+    case '<':
+      return left < right;
+    case '<=':
+      return left <= right;
+  }
+}
+
+/**
+ * wrong_operator: `target` is `a OP b ? x : y` with OP one of `>`, `>=`, `<`,
+ * `<=`, and the failing test calls the enclosing function with number literals
+ * that put `a` exactly on `b`, where OP and its boundary twin (`>` and `>=`,
+ * `<` and `<=`) disagree. Formed only when, for those literals, OP gives the
+ * value the run reported and the twin gives the value the failing assertion
+ * expects. Names (of tests, variables, or the incident) are never read as
+ * evidence. Any shape that is not read exactly, or any value that is not
+ * known, yields no candidate; a run reporting other values, or a passing test
+ * that also calls the function on the boundary, rejects it.
+ */
+function boundaryCandidates(
+  reproduction: Reproduction,
+  test: FailingTest,
+  match: Evidence,
+  computation: Computation,
+): HypothesisCandidate[] {
+  const { declaration, lines } = computation;
+  const { assertion, block, lines: testLines } = test;
+  const failure = reproduction.failure;
+  const run = reproduction.evidence;
+  const testEvidence = test.evidence;
+  const sourceEvidence = computation.evidence;
+  if (!declaration || !lines || !assertion || !block || !testLines || !failure || !run || !testEvidence || !sourceEvidence) return [];
+
+  const target = declaration.name;
+  const conditional = parseBoundaryConditional(declaration.expression);
+  const fn = enclosingFunction(lines, declaration);
+  if (!conditional || !fn || !declaration.text.startsWith('const ')) return [];
+  if (lines.some((line) => line.line > fn.line && line.line < declaration.line && !isStraightLine(line))) return [];
+  const exit = lines.find((line) => line.line > declaration.line && !isStraightLine(line));
+  if (!exit || !returnsLocalAs(exit, target)) return [];
+
+  const [object, property, ...rest] = assertion.subject.split('.');
+  if (object === undefined || property !== target || rest.length > 0) return [];
+  if (!isNumberLiteral(assertion.expected) || failure.actual === undefined || !isNumberLiteral(failure.actual)) return [];
+  const expected = Number(assertion.expected);
+  const actual = Number(failure.actual);
+  if (!importsName(testLines, test.path, fn.name, computation.path)) return [];
+
+  const callPattern = new RegExp(`(?<![\\w$.])${fn.name.replace(/\$/g, '\\$')}\\s*\\(`);
+  const callsIn = (from: number, to: number) =>
+    testLines.filter((line) => line.line >= from && line.line <= to && callPattern.test(line.text));
+  const subjectCalls = testLines
+    .filter((line) => line.line >= block.startLine && line.line < assertion.line)
+    .flatMap((line) => parseLiteralCall(line) ?? [])
+    .filter((call) => call.name === object);
+  const [call, ...otherCalls] = subjectCalls;
+  if (!call || otherCalls.length > 0 || call.callee !== fn.name || call.args.length !== fn.parameters.length) return [];
+
+  const localNames = new Set(computation.locals.map((local) => local.name));
+  const constants = new Map(computation.constants.map((constant) => [constant.name, constant.value]));
+  const evaluate = (args: readonly number[]) => {
+    const value = (operand: string): number | undefined => {
+      if (isNumberLiteral(operand)) return Number(operand);
+      const index = fn.parameters.indexOf(operand);
+      if (index >= 0) return args[index];
+      return localNames.has(operand) ? undefined : constants.get(operand);
+    };
+    const [left, right, whenTrue, whenFalse] = [conditional.left, conditional.right, conditional.whenTrue, conditional.whenFalse].map(value);
+    if (left === undefined || right === undefined || whenTrue === undefined || whenFalse === undefined) return undefined;
+    const pick = (operator: BoundaryOperator) => (holds(operator, left, right) ? whenTrue : whenFalse);
+    return { left, right, current: pick(conditional.operator), twin: pick(BOUNDARY_TWIN[conditional.operator]) };
+  };
+
+  const failing = evaluate(call.args);
+  if (!failing || !sameNumber(failing.left, failing.right)) return [];
+  if (sameNumber(failing.current, expected) || !sameNumber(failing.twin, expected)) return [];
+  const twin = BOUNDARY_TWIN[conditional.operator];
+  const sourceLine = lines.find((line) => line.line === declaration.line);
+  if (!sourceLine || replaceBinaryOperator(sourceLine.text, conditional.operator, twin) === undefined) return [];
+
+  const comparison = `${conditional.left} ${conditional.operator} ${conditional.right}`;
+  const fixed = `${conditional.left} ${twin} ${conditional.right}`;
+  const reported = failure.comparison ?? failure.resultLine;
+  const support: Finding[] = [
+    {
+      statement: `\`${target}\` is computed as \`${declaration.expression}\` in \`${fn.name}(${fn.parameters.join(', ')})\`, which returns it as \`${target}\`.`,
+      quote: declaration.text,
+      evidenceIds: unique([sourceEvidence.id, match.id]),
+    },
+    {
+      statement: `The failing test calls \`${call.text}\`, so \`${conditional.left}\` = ${failing.left} and \`${conditional.right}\` = ${failing.right}, exactly the boundary: \`${comparison}\` gives ${failing.current}, while \`${fixed}\` gives ${failing.twin}, the value the failing assertion on \`${assertion.subject}\` expects.`,
+      quote: call.text,
+      evidenceIds: unique([testEvidence.id, sourceEvidence.id]),
+    },
+  ];
+  const contradiction: Finding[] = [];
+
+  const reportsComputedValues =
+    sameNumber(actual, failing.current) && (failure.expected === undefined || (isNumberLiteral(failure.expected) && sameNumber(Number(failure.expected), expected)));
+  if (reportsComputedValues) {
+    support.push({
+      statement: `The run reports \`${assertion.subject}\` as ${actual} where ${expected} was expected, which is what \`${comparison}\` gives on the boundary.`,
+      quote: reported,
+      evidenceIds: [run.id],
+    });
+  } else {
+    contradiction.push({
+      statement: `The run reports \`${assertion.subject}\` as ${failure.actual}${failure.expected === undefined ? '' : ` where ${failure.expected} was expected`}, but \`${declaration.expression}\` gives ${failing.current} for the failing test's arguments, so this computation does not explain the failure.`,
+      quote: reported,
+      evidenceIds: unique([run.id, sourceEvidence.id]),
+      decisive: true,
+    });
+  }
+
+  const passed = new Set(reproduction.observation?.passed.map((item) => item.name));
+  for (const other of findTestBlocks(testLines).filter((item) => passed.has(item.name) && item.name !== failure.name)) {
+    for (const line of callsIn(other.startLine, other.endLine)) {
+      const otherCall = parseLiteralCall(line);
+      if (!otherCall || otherCall.callee !== fn.name || otherCall.args.length !== fn.parameters.length) return [];
+      const values = evaluate(otherCall.args);
+      if (!values) return [];
+      if (sameNumber(values.left, values.right) && !sameNumber(values.current, values.twin)) {
+        contradiction.push({
+          statement: `Test "${other.name}" reported ok while calling \`${otherCall.text}\` on the same boundary, where \`${fixed}\` would change \`${target}\` from ${values.current} to ${values.twin}.`,
+          quote: otherCall.text,
+          evidenceIds: unique([testEvidence.id, run.id]),
+          decisive: true,
+        });
+      }
+    }
+  }
+
+  const contradicting = new Set(contradiction.flatMap((finding) => finding.evidenceIds));
+  return [
+    {
+      id: hypothesisId('boundary', target),
+      kind: 'wrong_operator',
+      statement: `\`${target}\` compares \`${comparison}\` where the failing test needs \`${fixed}\`: it calls \`${fn.name}\` exactly on that boundary.`,
+      support: support.filter((finding) => !finding.evidenceIds.some((id) => contradicting.has(id))),
+      contradiction,
+      operatorSubstitution: { path: computation.path, line: declaration.line, from: conditional.operator, to: twin },
+    },
+  ];
+}
+
+/** Whether a line of `fromPath` is `import { ..., name, ... } from '<relative path to modulePath>'`. */
+function importsName(lines: readonly SourceLine[], fromPath: string, name: string, modulePath: string): boolean {
+  const directory = path.dirname(fromPath);
+  return lines.some((line) => {
+    const found = /^\s*import\s*\{([^}]*)\}\s*from\s*['"](\.{1,2}\/[^'"]+)['"]\s*;?\s*$/.exec(line.text);
+    if (!found) return false;
+    const names = (found[1] ?? '').split(',').map((item) => item.trim());
+    return names.includes(name) && path.normalize(path.join(directory, found[2] ?? '')) === modulePath;
+  });
 }
 
 function sameNumber(left: number, right: number): boolean {

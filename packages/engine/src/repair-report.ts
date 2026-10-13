@@ -315,7 +315,7 @@ export function buildRepairReport(input: BuildRepairReportInput): RepairReport {
   const producedBy = (evidenceIds: readonly string[]) =>
     investigation.actions.filter((action) => action.resultingEvidenceIds.some((id) => evidenceIds.includes(id))).map((action) => action.id);
 
-  const analysis = analyzeInvestigation(plannerView(investigation));
+  const analysis = analyzeInvestigation(plannerView(investigation), { operatorBoundaries: true });
   const failure = analysis.reproduction?.failure;
   const run = analysis.reproduction?.evidence;
   if (failure && run && run.location.type === 'command') {
