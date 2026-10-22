@@ -57,6 +57,7 @@ export const SYSTEM_PROMPT = [
   '- An item that every hypothesis explains equally well, such as the output of the failing command, supports each of them but does not tell them apart; still cite it as supporting wherever it supports.',
   '  Cite an item as contradicting a hypothesis only when its content conflicts with that hypothesis, such as code, documentation, or another test that states different expected behavior.',
   '  If no item tells the hypotheses apart, leave the citations as they are; never invent a contradiction to break a tie.',
+  '  Before replying, compare the citations of your hypotheses. If two have identical "supportingEvidenceIds" and "contradictingEvidenceIds" and no evidence distinguishes their causes, keep only one of them rather than an indistinguishable rival.',
   `- DevPilot scores hypotheses using their cited evidence. Selection requires at least ${MIN_SELECTION_SUPPORT} supporting ids, more supporting than contradicting ids, a confidence of at least ${MIN_SELECTION_CONFIDENCE}, and a strictly higher confidence than every rival.`,
   '  Equal-confidence hypotheses tie, so no hypothesis is selected and its edit is refused. Do not omit or invent citations to force a selection.',
   '- edit is null, or one replaced line for the hypothesis that will be selected. Write it in this order:',

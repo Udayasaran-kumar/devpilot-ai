@@ -306,6 +306,15 @@ describe('renderEscalationPrompt', () => {
     assert.ok(SYSTEM_PROMPT.includes('never invent a contradiction'), 'contradictions are never manufactured');
   });
 
+  it('asks the model to compare citations and keep one of two hypotheses that no evidence tells apart', () => {
+    const instruction =
+      'Before replying, compare the citations of your hypotheses. If two have identical "supportingEvidenceIds" and "contradictingEvidenceIds" and no evidence distinguishes their causes, keep only one of them rather than an indistinguishable rival.';
+    const position = SYSTEM_PROMPT.indexOf(instruction);
+    assert.ok(position >= 0, 'the instruction is present');
+    assert.ok(SYSTEM_PROMPT.indexOf('never invent a contradiction to break a tie') < position, 'it follows the rule against inventing contradictions');
+    assert.ok(position < SYSTEM_PROMPT.indexOf('- DevPilot scores hypotheses using their cited evidence.'), 'before the selection rule');
+  });
+
   it('names no vocabulary of the shipping fixture', () => {
     for (const word of ['shipping', 'threshold', 'flat', 'subtotal', '500']) {
       assert.ok(!SYSTEM_PROMPT.toLowerCase().includes(word), word);
