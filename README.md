@@ -14,6 +14,18 @@ Built for the **Build, Ship, Shape: Amazon Developer Hackathon**.
 
 ---
 
+## Demo
+
+Watch the end-to-end DevPilot repair workflow:
+
+https://vimeo.com/1238824535
+
+The demo shows a failing shipping test, evidence collection, hypothesis
+selection, repair proposal, isolated Git worktree verification, and a
+grounded repair report.
+
+---
+
 ## Why DevPilot?
 
 AI coding agents can produce plausible fixes without proving that the fix actually addresses the reported failure.
@@ -323,6 +335,20 @@ This creates a useful separation:
                            ▼
                     RED → PATCH → GREEN
 ```
+
+---
+
+## AWS / Amazon Bedrock
+
+DevPilot uses Amazon Bedrock for model-assisted planning when deterministic,
+evidence-driven reasoning cannot sufficiently explain an incident.
+
+The rule-first planner is attempted first. When escalation is required, the
+Bedrock planner operates within the same evidence-grounded investigation and
+proposal/review/verification pipeline.
+
+This keeps model usage bounded while ensuring that model-generated repair
+proposals remain subject to deterministic verification.
 
 ---
 
