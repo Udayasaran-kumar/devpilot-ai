@@ -38,6 +38,7 @@ export interface DevPilotHost {
 export async function startDevPilotHost(options: DevPilotHostOptions): Promise<DevPilotHost> {
   const planner = new EscalatingPlanner({
     model: options.model,
+    operatorBoundaries: true,
     ...(options.modelTimeoutMs !== undefined ? { timeoutMs: options.modelTimeoutMs } : {}),
     ...(options.maxModelCalls !== undefined ? { maxModelCalls: options.maxModelCalls } : {}),
     ...(options.onEscalation ? { onEvent: options.onEscalation } : {}),

@@ -63,8 +63,16 @@ type FallbackDiagnostics = Pick<
 
 export interface EscalatingPlannerOptions {
   readonly model: ModelClient;
-  /** Defaults to the evidence-driven `RulePlanner`. */
+  /**
+   * The rules consulted first. Defaults to the evidence-driven `RulePlanner`,
+   * with boundary-operator hypotheses only when `operatorBoundaries` is set.
+   */
   readonly rules?: Planner;
+  /**
+   * Passed to the default rule planner. Ignored when `rules` is given.
+   * Off by default, so an incident the rules cannot read still escalates.
+   */
+  readonly operatorBoundaries?: boolean;
   readonly timeoutMs?: number;
   /** Model calls this planner may make in this process; once spent, escalation is disabled. */
   readonly maxModelCalls?: number;
@@ -114,7 +122,7 @@ export class EscalatingPlanner implements Planner {
       throw new RangeError('maxModelCalls must be a non-negative integer');
     }
     this.#model = options.model;
-    this.#rules = options.rules ?? new RulePlanner();
+    this.#rules = options.rules ?? new RulePlanner({ operatorBoundaries: options.operatorBoundaries === true });
     this.#timeoutMs = timeoutMs;
     this.#maxModelCalls = maxModelCalls;
     this.#onEvent = options.onEvent;

@@ -118,13 +118,10 @@ describe('DevPilot host: escalating planner behind the unchanged MCP server', ()
     assert.ok(!JSON.stringify(checkoutResult).includes('hyp-model-'));
   });
 
-  it('the incident the rules cannot explain is escalated once and its repair verified, over MCP', () => {
-    assert.equal(model.requests.length, 1);
-    assert.equal(host.planner.modelCalls, 1);
-    assert.deepEqual(
-      escalations.map((event) => [event.type, event.type === 'escalated' ? event.selectedHypothesisId : event.reason]),
-      [['escalated', 'hyp-model-threshold-comparison']],
-    );
+  it('an evidence-backed boundary comparison is repaired over MCP without a model call', async () => {
+    assert.equal(model.requests.length, 0);
+    assert.equal(host.planner.modelCalls, 0);
+    assert.deepEqual(escalations, []);
     assert.equal(shippingResult.job.status, 'completed', shippingResult.job.failureReason);
     const outcome = shippingResult.outcome;
     assert.ok(outcome);
@@ -132,9 +129,30 @@ describe('DevPilot host: escalating planner behind the unchanged MCP server', ()
     assert.equal(outcome.repairStatus, 'repaired');
     assert.deepEqual(outcome.baselineFailures.map((failure) => failure.testName), ['ships free exactly at the threshold']);
     assert.deepEqual(outcome.affectedFiles, ['src/shipping.ts']);
-    assert.ok(outcome.claims.some((claim) => claim.kind === 'verification'));
-    assert.ok(outcome.claims.some((claim) => claim.kind === 'proposal' && claim.statement.includes('hyp-model-threshold-comparison')));
+    assert.ok(!JSON.stringify(shippingResult).includes('hyp-model-'));
+
+    const boundary = outcome.claims.find((claim) => claim.kind === 'finding' && claim.statement.includes('subtotal >= freeThreshold'));
+    assert.equal(
+      boundary?.statement,
+      'Supports hyp-boundary-shipping: The failing test calls `const quote = quoteShipping(5000, 5000, 500);`, so `subtotal` = 5000 and `freeThreshold` = 5000, exactly the boundary: `subtotal > freeThreshold` gives 500, while `subtotal >= freeThreshold` gives 0, the value the failing assertion on `quote.shipping` expects.',
+    );
+    assert.equal(boundary?.quote, 'const quote = quoteShipping(5000, 5000, 500);');
+    const proposal = outcome.claims.find((claim) => claim.kind === 'proposal');
+    assert.equal(proposal?.statement, 'The planner proposed changing src/shipping.ts for hyp-boundary-shipping; review status: awaiting_verification.');
+    const verified = outcome.claims.find((claim) => claim.kind === 'verification');
+    assert.equal(verified?.statement, 'Verified: the previously failing test "ships free exactly at the threshold" (test/shipping.test.ts) passed after the repair.');
+    assert.equal(verified?.quote, 'ok 3 - ships free exactly at the threshold');
+    assert.ok(
+      outcome.limitations.includes('DevPilot removed the verification worktree after the run; the patch was not applied to the repository.'),
+      'the repair ran in a worktree and that worktree was removed',
+    );
     assert.match(outcome.spokenSummary, /verified a patch in an isolated worktree: "ships free exactly at the threshold" passed/);
+
+    const fixtureSource = await readFile(path.join(SHIPPING_ROOT, 'src/shipping.ts'), 'utf8');
+    const registeredSource = await readFile(path.join(shipping.root, 'src/shipping.ts'), 'utf8');
+    assert.ok(fixtureSource.includes(SHIPPING_BUGGY_LINE), 'the original fixture keeps the strict comparison');
+    assert.ok(registeredSource.includes(SHIPPING_BUGGY_LINE), 'the registered git copy keeps the strict comparison');
+    assert.equal(git(realGit, shipping.root, 'status', '--porcelain'), '');
   });
 
   it('responses carry no model text, diff, host path, or token, and the repositories are unmodified', async () => {

@@ -1,728 +1,538 @@
 # DevPilot AI
 
-An evidence-grounded developer agent. Give it a failure signal (a failing test,
-CI failure, stack trace, bug report, or log output) and it investigates a real
-repository with controlled tools, weighs competing hypotheses against
-supporting and contradicting evidence, and only claims a fix is verified after
-proving it red-to-green in an isolated git worktree.
+**Evidence-grounded autonomous software repair.**
 
-Built for the Build, Ship, Shape: Amazon Developer Hackathon.
+DevPilot takes a software failure signal—such as a failing test, CI failure, stack trace, bug report, or log output—and investigates the repository using controlled tools.
 
-> Status: early. Domain schemas, the event-sourced engine, a minimal CLI,
-> sandboxed repository tools (`read_file`, `search_code`, `list_files`,
-> `run_command`), RED/GREEN verification of command results, isolated git
-> worktrees, `apply_patch`, a deterministic RED -> PATCH -> GREEN repair
-> workflow that verifies the specific failing tests, and a deterministic evidence-grounded planner that proposes
-> patches (with a patch safety policy and a grounded repair report) exist, with
-> a transport-free service layer and a self-hosted MCP server over it. The
-> Bedrock planner, HTTP API, and web UI are not implemented yet.
+It collects evidence, evaluates competing hypotheses, proposes a minimal patch, reviews that proposal, and only considers a repair successful after reproducing the failure and proving the same failure is resolved in an isolated Git worktree.
 
-## Principles
+The core repair path is:
 
-- **Grounded claims.** Every evidence item has a stable, content-addressed ID
-  and a source location. Hypotheses and report claims cite evidence IDs; the
-  engine rejects references to evidence that was never collected.
-- **Verified, not asserted.** A fix counts as verified only when the failing
-  command goes from red to green inside a temporary worktree, and the
-  specific tests that failed are observed passing.
-- **Event-sourced.** Every state change is a serializable `InvestigationEvent`.
-  State is a pure reduction of the event log, so runs can be streamed, stored,
-  and replayed.
-- **Bounded.** Investigations run under explicit step and time budgets and
-  always end in a terminal state.
-- **Incident-agnostic.** No objectives, search terms, hypothesis rules, or
-  report text are hardcoded for a specific incident. Strategy comes from
-  planners; expected answers live only in evaluation fixtures.
+**INCIDENT → EVIDENCE → HYPOTHESES → PROPOSAL → REVIEW → RED → PATCH → GREEN → GROUNDED REPORT**
+
+Built for the **Build, Ship, Shape: Amazon Developer Hackathon**.
+
+---
+
+## Why DevPilot?
+
+AI coding agents can produce plausible fixes without proving that the fix actually addresses the reported failure.
+
+DevPilot takes a different approach:
+
+- **Evidence before conclusions**
+- **Rules before model escalation**
+- **Competing hypotheses instead of a single guess**
+- **Proposal review before modification**
+- **Isolated worktree repair**
+- **Failure-specific verification**
+- **Original repository protection**
+- **Replayable, grounded investigation state**
+
+A repair is not accepted merely because a command exits with code `0`.
+
+The specific failure observed during the RED baseline must also be demonstrated as passing after the patch.
+
+---
+
+## Core Principles
+
+### Grounded claims
+
+Every evidence item has a stable, content-addressed ID and a source location.
+
+Hypotheses and report claims cite evidence IDs, and the engine rejects references to evidence that was never collected.
+
+### Verified, not asserted
+
+A fix counts as verified only when the failing command goes from RED to GREEN inside a temporary worktree, and the specific tests that failed are observed passing.
+
+### Event-sourced
+
+Every state change is represented as an `InvestigationEvent`.
+
+State is derived by reducing the event log, allowing investigations to be serialized, replayed, streamed, and validated.
+
+### Bounded
+
+Investigations operate under explicit step and time budgets and terminate in a defined state.
+
+### Incident-agnostic
+
+The investigation engine does not hardcode the answer to a particular incident.
+
+Strategy comes from planners; expected answers exist only in evaluation fixtures.
+
+---
 
 ## Architecture
 
-```
+```text
 apps/
-  cli/        Command-line entry point (minimal today)
-  mcp/        Self-hosted MCP server (Streamable HTTP) over the service layer
-  api/        HTTP API (planned)
-  web/        React web UI (planned)
+  cli/        Command-line entry point
+  mcp/        Self-hosted MCP server over the service layer
+  api/        HTTP API
+  web/        React web UI
+
 packages/
-  core/       Zod schemas: Signal, Evidence, Hypothesis, InvestigationAction,
-              VerificationResult, PatchProposal, RepairReport, InvestigationEvent
-  tools/      Tool contract and registry, RepositorySandbox, CommandPolicy, and
-              the read_file, search_code, list_files, and run_command tools
-  planners/   Planner contract, PlannerDecision schema, evidence-driven RulePlanner
-  engine/     InvestigationState, reducer, InvestigationSession, InvestigationEngine,
-              RepairWorkflow, patch policy and review, GroundedRepairPipeline,
-              repair report and grounding validator
-  service/    Transport-free orchestration: repository registry, investigation
-              jobs over GroundedRepairPipeline, grounded result projection
-  eval/       Fixture, GroundTruth, EvaluationResult, Evaluator contracts
+  core/       Zod schemas for investigation data
+  tools/      Repository tools, sandbox and command policy
+  planners/   Planner contract and deterministic RulePlanner
+  engine/     Investigation engine, repair workflow and grounding
+  service/    Transport-free investigation orchestration
+  eval/       Evaluation and ground-truth contracts
+
 fixtures/     Sample repositories used by tests and evaluation
 tests/        Cross-package integration tests
 ```
 
-### Repository tools
+The current working system is centered around the service, planner, repair engine, and self-hosted MCP/host composition.
 
-All filesystem access goes through a `RepositorySandbox` bound to one
-repository root. Each requested path is checked lexically, then resolved with
-`realpath` and checked again against the canonical root using path-relative
-comparison (not string prefixes), so `../` traversal, outside absolute paths,
-and symlinks that escape the root are rejected. Directory walks never follow
-symlinks and skip `.git`, `.devpilot`, and `node_modules`; binary, non-UTF-8,
-and oversized files are never returned.
+---
 
-| Tool          | Observes                                         | Evidence                       |
-| ------------- | ------------------------------------------------ | ------------------------------ |
-| `read_file`   | A UTF-8 file or inclusive 1-based line range     | One `source_code` item         |
-| `search_code` | Case-sensitive literal matches, one per line     | One `search_result` per match  |
-| `list_files`  | Sorted recursive listing of files and dirs       | None (structural only)         |
-| `run_command` | Exit code, stdout, stderr, timeout of a command  | One `command_output` item      |
-| `apply_patch` | Applies a unified diff, in a worktree only       | One `patch_application` item   |
+## Investigation Flow
 
-Evidence IDs come from `createEvidenceId` over the tool name, the exact
-location, and the observed content, so the same observation always has the
-same ID. `createDefaultToolRegistry(sandbox)` registers all four tools.
-
-### Command execution
-
-`run_command` takes an argv array (`{ "command": "npm", "args": ["test"] }`)
-and never uses a shell. Commands must pass an explicit `CommandPolicy`; the
-default allows only `npm test`, optionally followed by `--` and plain script
-arguments. The working directory must pass the same sandbox checks as file
-paths. Commands get a minimal environment (`PATH`, `HOME`, temp and locale
-variables, plus `NO_COLOR` and npm settings that disable network side
-effects); secret-looking names such as `AWS_*` or `*_API_KEY` are never
-passed, and `PATH` entries that are relative or inside the repository are
-removed. Each run has a timeout (default 10s, maximum 30s) that kills the
-whole process group, and stdout and stderr are each capped at 64 KiB. The
-repository root is replaced with `<repo>` in captured output.
-
-`verifyCommandResult` turns a command result into a `VerificationResult`.
-Exit code 0 is GREEN and non-zero is RED, but a RED run only confirms a
-reproduction when its output contains text taken from the signal; otherwise
-it is `inconclusive`. Timeouts and terminations are `inconclusive`, and
-commands that cannot start are `not_run`. Given the command's output, it also
-identifies the failing tests in a RED run, and given a baseline it confirms a
-GREEN run only if those same tests passed (see
-[Failure-specific verification](#failure-specific-verification)).
-
-### Isolated worktree workspaces
-
-`GitWorktreeWorkspace.create(repositoryRoot, { allowedRoot })` checks out the
-repository's current commit as a detached `git worktree` at
-`<repository>/.devpilot/worktrees/<name>`, so files can change there while the
-original working tree stays untouched. `getSandbox()` returns a
-`RepositorySandbox` rooted at the worktree, so the repository tools and
-`run_command` work on it unchanged. `remove()` runs `git worktree remove
---force`, discarding the worktree's changes; it is idempotent.
-
-- The repository must be the top level of a git working tree with at least
-  one commit, inside `allowedRoot` after symlinks are resolved.
-- `.devpilot` and `.devpilot/worktrees` must be real directories, not symlinks.
-  The workspace directory is claimed with an exclusive `mkdir`, so an existing
-  path is never reused. A failed `create` removes what it made.
-- `.devpilot/.gitignore` (containing `*`) is created if missing, so the
-  original repository's `git status` stays clean without editing its own
-  `.gitignore`.
-- `remove()` only deletes the directory it created, and only while it is
-  still a real directory that git lists as a worktree of the repository.
-- git runs from internally built argv arrays without a shell, with hooks and
-  `core.fsmonitor` disabled and a filtered environment. `resolveGitExecutable`
-  probes each `git` on `PATH` with `git --version` and uses the first that
-  works, skipping broken shims such as macOS's `/usr/bin/git` before the Xcode
-  license is accepted.
-
-### Applying patches
-
-```
-investigation repository   (read-only tools: read_file, search_code, list_files, run_command)
-        |
-isolated git worktree      (GitWorktreeWorkspace, .devpilot/worktrees/<name>)
-        |
-validated apply_patch      (only registered for a worktree)
-        |
-repair workflow            (RED -> patch -> GREEN, see below)
+```text
+                 ┌─────────────────────┐
+                 │    Failure Signal   │
+                 │ test / CI / logs    │
+                 └──────────┬──────────┘
+                            │
+                            ▼
+                 ┌─────────────────────┐
+                 │     Evidence       │
+                 │ read/search/run    │
+                 └──────────┬──────────┘
+                            │
+                            ▼
+                 ┌─────────────────────┐
+                 │     Hypotheses      │
+                 │ evidence grounded   │
+                 └──────────┬──────────┘
+                            │
+                    ┌───────┴────────┐
+                    │                │
+             Rule-solvable       Uncertain
+                    │                │
+                    │                ▼
+                    │        ┌───────────────┐
+                    │        │ Model         │
+                    │        │ Escalation    │
+                    │        └───────┬───────┘
+                    │                │
+                    └────────┬───────┘
+                             ▼
+                    ┌─────────────────┐
+                    │ Patch Proposal  │
+                    └────────┬────────┘
+                             ▼
+                    ┌─────────────────┐
+                    │ Proposal Review │
+                    └────────┬────────┘
+                             ▼
+                    ┌─────────────────┐
+                    │ RED baseline    │
+                    └────────┬────────┘
+                             ▼
+                    ┌─────────────────┐
+                    │ Isolated        │
+                    │ Git worktree    │
+                    └────────┬────────┘
+                             ▼
+                    ┌─────────────────┐
+                    │ Apply Patch     │
+                    └────────┬────────┘
+                             ▼
+                    ┌─────────────────┐
+                    │ GREEN           │
+                    │ same failure    │
+                    │ now passes      │
+                    └────────┬────────┘
+                             ▼
+                    ┌─────────────────┐
+                    │ Grounded Report │
+                    └─────────────────┘
 ```
 
-**Patches are applied only inside the isolated worktree, never to the
-original checkout.** `apply_patch` is registered only by
-`createWorkspaceTools(workspace)` / `createWorkspaceToolRegistry(workspace)`.
-The repository registry (`createDefaultToolRegistry`) stays read-only. The
-tool refuses to run unless its workspace is active, its root still exists,
-and the root is a linked worktree (`.git` is a file) directly under
-`.devpilot/worktrees`.
+---
 
-Input is `{ patch, description? }` and nothing else, so there is no way to
-pass paths, strip levels, or git options. The patch is a git-style unified
-diff (`--- a/<path>`, `+++ b/<path>`, `/dev/null` to create or delete),
-parsed by a strict internal parser and applied in memory. No subprocess,
-shell, or `git apply` is involved.
+## Repository Safety
 
-- **Refused as `invalid_patch`:** prose, malformed headers or hunks, hunk
-  line counts that disagree with their header, binary patches, renames,
-  copies, mode changes, quoted paths, a `diff --git` line that disagrees with
-  its `---`/`+++` lines, or the same file twice.
-- **Refused as `unsafe_path`:** absolute paths, backslashes, `.` or `..`
-  segments, any segment named `.git` or `.devpilot` (case-insensitive), and
-  symlink or submodule modes.
-- **Symlinks:** each target is resolved through the worktree's
-  `RepositorySandbox` and must resolve to exactly its own lexical path. A
-  patch therefore never writes through a symlink, whether the final file or
-  any parent directory, even one pointing inside the worktree.
-- **All-or-nothing:** every hunk must match the current file contents (exact
-  context; a hunk may sit at a different line than its header says). If any
-  file fails, the result is `rejected` and nothing is written. If a write fails
-  part-way, completed writes are rolled back and the result is
-  `application_failed`. Modified files are replaced via a temp file and
-  `rename`, keeping their mode.
-- **Evidence:** every attempt, successful or not, returns one
-  `patch_application` evidence item. It holds the status, reason, workspace
-  name, file list, patch sha256, and patch text, but no host paths.
+All filesystem access goes through a `RepositorySandbox` bound to a repository root.
 
-### Repair workflow (RED -> PATCH -> GREEN)
+Requested paths are checked before and after resolution, preventing:
 
-`RepairWorkflow` checks a proposed patch against a failing command. It is a
-deterministic orchestrator over the primitives above; it does not choose,
-write, or improve patches, and it never commits, merges, or pushes.
+- `../` traversal
+- outside absolute paths
+- symlink escapes
 
-```
-original repo --run_command (read-only registry)--> RED confirmed?   no -> stop, no worktree
-      |
-GitWorktreeWorkspace (same files as the baseline) --same run_command--> RED?   no -> stop
-      |
-apply_patch (worktree registry)                                       not applied -> stop
-      |
-run_command, same argv, in the worktree --> GREEN confirmed?          no -> stop
-      |
-original unchanged + worktree changes == patched files -> repaired
-```
+Directory walks do not follow symlinks and skip `.git`, `.devpilot`, and `node_modules`.
 
-Using the checkout fixture, whose test fails because tax is charged on the
-pre-discount subtotal:
+Binary, non-UTF-8, and oversized files are not returned as repository evidence.
 
-1. The request carries the repository root, the signal (failing test output),
-   the verification command as argv (`npm`, `["test"]`), expected-failure
-   text copied from the signal, and the patch. There are no fields for a
-   shell, working directory, environment, executable path, or git arguments;
-   the command must pass the `CommandPolicy`, and the request is refused
-   before anything runs if it does not.
-2. `npm test` runs on the original repository. It must exit non-zero **and**
-   print the expected failure (`applies tax to the discounted amount`,
-   `200 !== 180`). Its TAP output must also name the failing tests, each
-   with a location in the repository; those become the baseline failure
-   identities. Already passing gives `baseline_not_red`; timeouts, start
-   failures, a different failure, or failing tests that cannot be identified
-   give `baseline_inconclusive`. No worktree is created.
-3. A `GitWorktreeWorkspace` is created from `HEAD`. Its files must match the
-   original working tree the baseline ran on, and the same command must be a
-   confirmed RED there before the patch, failing the same tests. Otherwise
-   the result is `worktree_failed`, so the later GREEN can only be caused by
-   the patch.
-4. `apply_patch` applies the diff (`subtotal * TAX_RATE` ->
-   `discounted * TAX_RATE`) in the worktree. Any status other than `applied`
-   gives `patch_failed`, and the command is not rerun.
-5. The identical command (argv and timeout) runs in the worktree. Only a
-   confirmed GREEN continues, and GREEN needs more than exit code 0: every
-   baseline failure must be reported passing. RED, or a baseline failure that
-   still fails, is `verification_failed`. Timeouts, start failures, and an
-   exit code of 0 that does not show every baseline failure passing are
-   `verification_inconclusive`.
-6. Safety checks, any failure of which is `safety_check_failed`:
-   - the original's files and its git metadata (`HEAD`, refs, config, hooks)
-     match a fingerprint taken before the baseline;
-   - the worktree's `HEAD` is still the base commit;
-   - the files that differ from the baseline tree, by content (including
-     gitignored files) and by `git status`, are exactly the patched files;
-   - the patch adds no file whose **name** looks like a secret (`.env*`
-     except `.env.example`, `*.pem`, `*.key`, `id_rsa`, `.npmrc`,
-     `credentials*`, ...). This is a file-name check only; file contents are
-     not scanned;
-   - the patch changes no file that declares a baseline failing test.
-7. The result is `repaired`, with the baseline, unpatched-worktree, patch, and
-   final evidence IDs, the changed files, the baseline failure identities, and
-   the check of each against the final output. The worktree is kept for review
-   and the caller removes it. On failure it is removed; if removal itself
-   fails, the reason says so, `worktreeRetained` is true, and the workspace is
-   returned so the caller can remove it.
+---
 
-Each step is an event (`repair_started`, `baseline_verified`,
-`worktree_created`, `patch_applied`, `repair_verified` or `repair_failed`)
-alongside the usual action, evidence, and verification events. The reducer
-checks the proofs itself: each RED or GREEN must be a confirmed verification
-whose evidence is consistent with it and was produced by a `run_command`
-action, planned during that step, with exactly the repair's command,
-arguments, and timeout. The patch evidence must be an `applied` result in the
-same worktree for the requested patch, and `repair_verified` must list exactly
-the patched files. The reducer also re-reads the failing tests from the
-baseline evidence, requires the unpatched worktree to fail the same tests,
-and re-checks the final evidence against them: `repair_verified` is refused
-unless every baseline failure is reported passing. A replayed, reordered, or
-edited log therefore cannot claim a repair either. The log does not record
-which directory a command ran in; that the RED and GREEN runs happened in
-this repair's worktree is guaranteed by the workflow, which only ever builds
-those tools from the worktree it created.
+## Controlled Command Execution
 
-### Failure-specific verification
+`run_command` receives an argument vector rather than a shell command.
 
-The goal of verification is narrow: **the failure reproduced at baseline is
-resolved**. That is, the specific tests that failed in the RED run were
-observed passing in the GREEN run. It is not a claim that the patch is
-semantically correct.
+For example:
 
-A `FailureIdentity` is read from the baseline RED output and from nothing
-else. Callers, planners, and proposals have no field through which to supply
-one, and the strict schemas refuse one if they try:
-
-| Field                                       | From the failing test's TAP result                     |
-| ------------------------------------------- | ------------------------------------------------------ |
-| `testFile`, `line`                          | its `location`, relative to the repository             |
-| `suite`, `testName`                         | the enclosing `# Subtest:` headers and its result line |
-| `resultLine`                                | the result line, verbatim (`not ok 1 - adds numbers`)  |
-| `error`, `expected`, `actual`, `comparison` | the assertion in its YAML block, when present          |
-| `occurrence`                                | the first stack frame inside the repository            |
-| `evidenceId`                                | the RED command output it was read from                |
-
-Every failing test of the run gets an identity. A parent that failed only
-because a subtest failed is represented by that subtest. A run whose failures
-cannot be identified is `baseline_inconclusive`, never repaired. That includes
-a test file that failed as a whole (for example while loading), a failure
-with no location in the repository, and a test name that is not unique.
-
-The TAP parser (`parseTestOutput`, in `@devpilot/core`) reports, for every
-result, its suites and an outcome of `passed`, `failed`, `skipped` (`# SKIP`),
-or `todo` (`# TODO`). It also reports the closing plan (`1..N`) and tests that
-started without a result. Text that a test prints itself is `#`-prefixed by
-the runner and cannot be mistaken for a result.
-
-The final run confirms GREEN only if all of these hold:
-
-- the command exited 0;
-- each baseline failure is reported **exactly once**, matched by suites and
-  name, with outcome `passed`, and not from a different file;
-- the run has a closing plan that matches its top-level results;
-- no test file of a baseline failure is reported as a single result. That is
-  what `node --test` prints for a file that exited before reporting its
-  tests, for example after `process.exit(0)`;
-- every test the baseline reported is still reported;
-- no test started without finishing.
-
-Otherwise the result is `verification_failed` if a baseline failure still
-failed, and `verification_inconclusive` in every other case. Those cases
-include:
-
-- a skipped or TODO target;
-- a target that is not reported at all (deleted, renamed, or the file exited
-  early);
-- a same-named stand-in that makes the name ambiguous;
-- a run that stopped early.
-
-With several baseline failures, all of them must pass. Another test passing
-never counts.
-
-**What `repaired` does not mean, and other limitations:**
-
-- It means the tests that failed at baseline were observed passing after the
-  patch, not that the patch is a correct fix. Proposals from a planner pass
-  the patch safety policy below, which refuses test files, before they reach
-  the workflow. `RepairWorkflow` called directly does not apply that policy.
-  Either way, a patch may not change a file that declares a baseline failing
-  test (`FailureIdentity.testFile`). The workflow ends with
-  `safety_check_failed`, and the reducer refuses `repair_verified`. This
-  holds whatever the file is called, including test files the policy's
-  naming patterns miss, such as `src/math-test.mjs`. Failure identity also
-  stops a patch from passing off a renamed, deleted, skipped, or replaced
-  test.
-- A malicious source patch can modify the test process itself, for example
-  by replacing what `assert.equal` does, because the patched code runs inside
-  the tests. Output-level failure verification cannot prove the integrity of
-  the test runner. This is outside the guarantee of the current repair
-  verifier.
-- `node --test` prints no location for a passing test, so the final run
-  matches a baseline failure by suites and name. That is unambiguous because
-  the name must be unique in both runs, every baseline test must still be
-  reported, and the target's file must not be reported as a single result.
-  But it is attribution by name, not by location.
-- Only TAP output from `node --test` is understood. Other test runners, and
-  test names that change between runs (for example ones that include a
-  timestamp), end as `baseline_inconclusive` or `verification_inconclusive`
-  rather than `repaired`.
-- The worktree is checked out from `HEAD`. Tracked uncommitted changes,
-  untracked files, and gitignored files in the original (other than
-  `node_modules`) make the worktree differ from what the baseline tested, so
-  the repair stops with `worktree_failed`; commit or stash them first. Tests
-  that need local, uncommitted configuration (for example a gitignored
-  `.env`) therefore cannot be repaired yet.
-- `node_modules`, `.git`, and `.devpilot` are not compared as files, and the
-  worktree has no `node_modules` of its own. It lives inside the original at
-  `.devpilot/worktrees/<name>`, so module resolution and config discovery
-  that search parent directories can read the original's `node_modules` and
-  files. The RED control run in the unpatched worktree is what keeps such
-  differences from producing a false GREEN.
-- Commands are not sandboxed by the operating system. The checks detect
-  changes inside the repository (files, refs, config, hooks); they cannot
-  see what a test does elsewhere on the machine. Staged changes in the
-  original's index and new objects in its object store are not compared.
-- Worktree creation and removal are serialized per repository within one
-  process; concurrent repairs from separate processes are not coordinated.
-  A process that crashes mid-repair leaves its worktree behind.
-
-### Evidence-grounded planning: the planner proposes, the workflow proves
-
-```
-Incident (signal)
-   -> Evidence            (read-only tools via the ToolRegistry and RepositorySandbox)
-   -> Competing hypotheses (proposed -> supported / weakened / rejected)
-   -> Evidence-grounded planner (selects one only when sufficiently supported)
-   -> Patch proposal      (typed; never applied by the planner)
-   -> Patch policy        (deterministic review; rejections are structured)
-   -> Deterministic RepairWorkflow
-   -> RED -> PATCH -> GREEN (isolated worktree)
-   -> Grounded report     (every claim cites evidence; validated)
-```
-
-Planning and execution are intentionally separated. The planner can propose a
-repair, but only the deterministic repair workflow can prove that the repair
-worked.
-
-A planner receives a deep-frozen copy of the investigation as plain data (no
-registry, sandbox, file system, or process handle) and returns one Zod-checked
-decision: `act` (only `read_file`, `search_code`, `list_files`, or
-`run_command`, each with a reason and the evidence it expects),
-`update_hypotheses`, `propose_patch`, or `finish`. Decisions are strict
-objects: there is no decision, field, or status through which a planner can
-apply a patch, write a file, or report a repair as `repaired`.
-
-**Hypotheses.** Each has a statement, status (`proposed`, `supported`,
-`weakened`, `rejected`, `selected`), supporting and contradicting evidence
-IDs, a `nextActionReason`, and a confidence the schema caps at
-`s / (s + c + 1)` over distinct supporting (`s`) and contradicting (`c`)
-evidence items. That bound is 0 without support and never reaches 1. A status
-must match its evidence, and `selected` needs at least two supporting items,
-more support than contradiction, confidence of at least 0.6, and strictly
-higher confidence than every other hypothesis. An evidence ID may appear only
-once per hypothesis, and never as both support and contradiction. The reducer
-enforces exclusive selection and refuses hypotheses that cite uncollected
-evidence.
-
-`selected` is the planner's assertion, checked only structurally. The reducer
-can confirm that the cited evidence exists and that the counts allow
-selection. It cannot confirm that an item really supports the statement. What
-selection unlocks is narrow: a proposal may be reviewed, and that review limits
-the patch to files the supporting evidence came from. Proving anything is left
-to `RepairWorkflow`.
-
-The log keeps proposals honest:
-
-- An evidence ID names one observation. Re-recording it with different
-  content or location is refused.
-- A proposal is refused as stale if evidence arrived after the hypotheses were
-  last updated, or while an action is still running.
-- An open proposal freezes the investigation. While it awaits review, only its
-  review may follow. Once accepted, only completion may follow, and a planner
-  that tries anything else ends the investigation as `failed`.
-- `replayInvestigation` schema-checks every event before reducing it, so a
-  stored log cannot assert an impossible hypothesis or proposal.
-
-**The `RulePlanner` strategy** is a pure function of what the investigation
-has observed. It names no files, symbols, or incidents:
-
-1. Run the signal's command (argv only) to reproduce the failure. Parse the
-   test output for the failing test, the first stack frame inside the
-   repository, and the actual and expected values.
-2. Read the test file. Find the failing assertion, the assertions that ran
-   before it in the same test, and the assertions in tests that passed.
-3. Search for where the asserted value is assigned, outside test files
-   (preferring files the test imports), and read that file.
-4. Generate competing hypotheses from the shape of the computation:
-   - an input is used where a value derived from it exists in the same
-     function;
-   - an input, or a value the test checked first, is itself wrong;
-   - a numeric constant used by the computation is wrong.
-5. Assess each one with findings that quote evidence:
-   - The source shows the computation.
-   - The failing test's name refers to the derived value.
-   - Substituting known values (constants, values asserted earlier) gives the
-     expected result, or a different one, which rejects the hypothesis.
-   - An earlier assertion in the same test held.
-   - A passing test asserts the same value.
-6. Select a hypothesis only if the schema's selection rules allow it, then
-   propose a one-line diff built from the file content in evidence.
-
-On the checkout fixture this proposes four hypotheses:
-
-| Hypothesis                                    | Status   | Confidence |
-| --------------------------------------------- | -------- | ---------- |
-| `tax` should use `discounted`, not `subtotal` | selected | 0.8        |
-| `subtotal` is wrong                           | weakened | 0          |
-| `discounted` is wrong                         | weakened | 0          |
-| `TAX_RATE` is wrong                           | weakened | 0          |
-
-The tests also run the planner on a different, payroll-shaped repository,
-where it proposes the analogous change. When nothing is sufficiently
-supported, it finishes without a proposal.
-
-**Patch safety policy and review.** The engine reviews every proposal before
-it can reach `RepairWorkflow`, and the reducer re-runs the same review when
-the log is replayed. The proposal is judged exactly as given and never
-rewritten; any violation rejects it with a typed code:
-
-- **Syntax:** the patch must parse with `apply_patch`'s own parser
-  (`invalid_patch`, `unsafe_path`), and its paths must equal `affectedPaths`,
-  with no path listed twice.
-- **Path policy:** names are matched case-insensitively, and non-canonical
-  paths (`./a`, `a//b`, `..`, backslashes) are refused, not normalised. The
-  patch may not touch:
-  - tests (`test_file`);
-  - test, compiler, and task-runner configuration such as `jest.config.*`,
-    `vitest.config.*`, `tsconfig*.json`, `.mocharc*`, `pytest.ini`,
-    `conftest.py`, and `Makefile` (`test_config`);
-  - package manifests and package-manager configuration (`package_manifest`);
-  - lockfiles (`lockfile`);
-  - installed or vendored dependencies (`dependency_directory`);
-  - CI and workflow files (`ci_config`);
-  - env or credential-like files (`credential_file`);
-  - `.git` or `.devpilot` (`protected_path`);
-  - anything outside the repository (`outside_repository`).
-- **Hypothesis link:** the proposal must belong to the selected hypothesis
-  (`hypothesis_not_selected`) and may not claim more confidence than it.
-- **Evidence:** it must cite supporting evidence (`missing_supporting_evidence`)
-  that was collected and that supports that hypothesis.
-- **Scope:** it may change only files the hypothesis's supporting evidence
-  was read from (`unrelated_file`), and no more of them (`too_many_files`).
-
-An accepted proposal is `awaiting_verification`, and the investigation ends.
-`GroundedRepairPipeline` then passes the patch, byte for byte, to
-`RepairWorkflow`. The workflow's expected-failure text is the failing test
-name and comparison, but only as far as the signal quotes them.
-
-The pipeline is the only path from a planner to `RepairWorkflow`: planners
-never see the workflow, a registry, or `apply_patch`. `RepairWorkflow` itself
-stays a lower-level trusted API that takes raw patch text. A repair run that
-way has no reviewed proposal, so its report fails validation.
-
-**Grounded report.** `buildRepairReport` produces a typed `RepairReport`:
-
-- the incident and the selected hypothesis with its confidence;
-- every hypothesis, with supporting and contradicting evidence;
-- the investigation actions and the proposal with its review outcome;
-- the affected files and the verification result;
-- the authoritative repair status, copied from the workflow result or
-  `not_attempted`;
-- limitations;
-- claims. Each claim cites evidence (and the actions that produced it).
-
-`validateRepairReport` refuses a report in any of these cases:
-
-- A claim cites uncollected evidence or actions that never ran.
-- An observation or finding has no verbatim quote, or its quote is absent
-  from the evidence it cites.
-- Success wording ("tests passed", "green", "fixed", "verified") appears
-  anywhere except a `verification` claim that cites the workflow's confirmed
-  GREEN evidence.
-- A claim asserts correctness: "The repair is correct" is always rejected.
-  The supported phrasing is "Repair verified against the configured
-  verification command." and, for each baseline failure, "Verified: the
-  previously failing test "..." (file) passed after the repair.", quoting
-  the final run's result line.
-- A success claim cites GREEN evidence that does not record every baseline
-  failure as passing. An exit code of 0 on its own is not enough. Each
-  baseline failure is also reported as an observation ("Baseline failure:
-  test ... failed on the original repository with `...`") quoting its RED
-  result line.
-- A claim is not one that `buildRepairReport` derives from the same logs, or
-  a derived claim is missing. A quote proves only that text exists. A
-  free-text statement under a genuine quote ("`tax` should NOT use
-  `discounted`") could invert it. So claims are re-derived, never accepted as
-  written, and contradicting findings cannot be dropped.
-- Any structured field, including limitations, differs from its derivation
-  from the logs. The report is a projection of the logs, not a second source
-  of truth.
-- The repair log is not this investigation's reviewed proposal run for the
-  same incident. That covers:
-  - a different patch: the SHA-256 of the proposal's exact bytes must match
-    the workflow's;
-  - a different hypothesis or command;
-  - a result that disagrees with its own log, including its baseline
-    failures and failure checks;
-  - a log from another investigation.
-
-**Limitations of the planner:**
-
-- It understands TAP output (`node --test`) and a few JavaScript/TypeScript
-  shapes: `assert.equal`/`strictEqual`/`deepEqual`, `expect().toBe()`,
-  `test()`/`it()` blocks, and single-line `const` declarations. Anything else
-  ends the investigation without a proposal rather than a guess.
-- Repairs are limited to substituting one identifier on one line.
-- Findings are lexical: name matching and arithmetic over literal values.
-  They are not semantic understanding.
-- Confidence counts evidence items and is not calibrated.
-- Derived claims restate the rule-based analysis. The validator checks that
-  the analysis is reproducible from the logs, not that it is right.
-
-**Limitations of the patch policy (known, not solved):**
-
-- The policy judges paths, not what a line of source does. A source-only
-  patch such as `process.exit(0);` at the top of an imported module still
-  passes review, and it makes `node --test` exit 0 without running a test.
-  It is no longer `repaired`, though: the test file is reported as a single
-  result and the baseline failure is not reported, so the workflow ends with
-  `verification_inconclusive` and the report makes no success claim. A
-  source patch that makes the failing test genuinely pass for the wrong
-  reason (for example by special-casing the asserted input, or by changing
-  the assertion library at import time) is not detected.
-- Scope is per file, not per line. Hunks are located by their content, as
-  with `git apply`, so line numbers in a hunk header cannot bound an edit.
-  Once a file is grounded by evidence, any change within it passes review.
-- Evidence IDs are content hashes, not signatures. A process that can write
-  the event log can forge tool output with valid IDs. Logs are trusted
-  records, and repository identity is not part of them.
-
-Real friction encountered while building this is recorded in
-[`HACKATHON_FRICTION_LOG.md`](HACKATHON_FRICTION_LOG.md).
-
-Package dependencies flow one way:
-
-```
-core  <-  tools  <-  planners  <-  engine  <-  service  <-  apps/*
-core  <-  eval
-```
-
-### Service layer
-
-`@devpilot/service` is transport-free orchestration: no protocol, network,
-or cloud code. Repositories are registered server-side under an opaque
-`repositoryId` with their root, allowed root, and verification command;
-callers pass only `{ repositoryId, signal?: { kind, title, content } }`
-(strict, size-bounded) and cannot supply paths, commands, planners, or
-budgets. The service builds the signal itself, runs one job per repository at
-a time through `GroundedRepairPipeline` only, removes the verification
-worktree, and re-validates the report against its logs. A client sees a
-projection: status, grounded claims, baseline failures, affected files,
-limitations, and a fixed-template summary, with no host paths, logs, or patch
-text. A report that fails grounding projects as "no verified result".
-
-Protocol adapters such as `apps/mcp` translate requests into service calls
-and add nothing to what the service allows.
-
-### MCP server
-
-`@devpilot/mcp` is a protocol adapter over the service layer: each MCP tool is
-one `InvestigationService` call, and it never reaches the engine or tools
-directly. It is the only package that imports the MCP SDK
-(`@modelcontextprotocol/server` and `@modelcontextprotocol/node`), served
-over Streamable HTTP from plain `node:http`.
-
-| Tool                       | Input                                        | Output                                 |
-| -------------------------- | -------------------------------------------- | -------------------------------------- |
-| `list_repositories`        | `{}`                                         | `{ repositories: RepositoryView[] }`   |
-| `start_investigation`      | `{ repositoryId, signal?: { kind, title, content } }` | the queued job                |
-| `get_investigation_result` | `{ jobId }`                                  | the job and, once completed, the grounded outcome |
-
-Inputs are the service's strict Zod schemas, so repository paths, commands,
-planners, and budgets are refused as unknown fields. Results carry
-`structuredContent` plus a short text block (the spoken summary once
-grounded). A failed call returns fixed text per service error code, or
-"DevPilot could not complete the request."; exception messages never reach a
-client.
-
-Run it:
-
-```sh
-DEVPILOT_MCP_TOKEN="$(openssl rand -hex 32)" \
-DEVPILOT_MCP_CONFIG=./devpilot-mcp.json \
-npm run mcp
-```
-
-| Variable                       | Meaning                                                                 |
-| ------------------------------ | ----------------------------------------------------------------------- |
-| `DEVPILOT_MCP_TOKEN`           | Required. Clients send `Authorization: Bearer <token>`. Never printed.  |
-| `DEVPILOT_MCP_CONFIG`          | Required. Server-side repository configuration (below).                 |
-| `DEVPILOT_MCP_PORT`            | Optional, default `8788`.                                               |
-| `DEVPILOT_MCP_ALLOWED_ORIGINS` | Optional comma-separated exact origins for browser-based clients.       |
-
-The configuration file registers repositories; relative roots resolve against
-the file's directory, and each repository must be a git working tree:
-
-```json
+```text
 {
-  "repositories": [
-    {
-      "repositoryId": "sample",
-      "displayName": "Sample service",
-      "repositoryRoot": "../sample-repo",
-      "verification": { "command": "npm", "args": ["test"] }
-    }
-  ]
+  "command": "npm",
+  "args": ["test"]
 }
 ```
 
-The endpoint is `http://127.0.0.1:8788/mcp`; the server binds to `127.0.0.1`
-only. Every request is checked in order: the path must be `/mcp` (else 404)
-and the method `POST` (else 405); the `Host` header must be `localhost`,
-`127.0.0.1`, or `[::1]` (else 403, which blocks DNS rebinding); an `Origin`
-header, if present, must be on the allowlist exactly (else 403); the bearer
-token must match, compared as SHA-256 digests with `timingSafeEqual` (else
-401 with `WWW-Authenticate: Bearer`). Bodies over 128 KiB get 413 and
-non-JSON bodies 415. The server is stateless per request (`createMcpHandler`
-with `responseMode: "json"`) and serves both 2026-07-28 clients and 2025-era
-clients without sessions; job state lives in the one `InvestigationService`
-the process creates.
+Commands must satisfy an explicit `CommandPolicy`.
 
-### Alexa+ style simulator
+The default policy allows `npm test`, optionally followed by plain script arguments.
 
-[`apps/alexa-simulator`](apps/alexa-simulator/README.md) is a web page that
-simulates an Alexa+ style conversation with DevPilot for the hackathon demo;
-it is not an Alexa product. The browser is not an MCP client: it posts each
-utterance to the simulator's `/api/dialog`, whose backend answers with the
-voice demo's `VoiceDialog` over `DevPilotMcpClient`. The browser receives
-only the dialog's response and state, and the MCP token stays on the server.
+The command runner:
 
-```sh
-DEVPILOT_MCP_TOKEN="<the MCP server's token>" npm run simulator
+- does not invoke a shell
+- validates the working directory
+- uses a filtered environment
+- removes unsafe `PATH` entries
+- prevents secret-looking environment variables from being passed
+- enforces execution timeouts
+- caps captured stdout and stderr
+- replaces the repository root with `<repo>` in captured output
+
+A non-zero exit code alone is not sufficient to establish that an incident was reproduced.
+
+---
+
+## Isolated Git Worktrees
+
+Repairs never modify the original checkout.
+
+A `GitWorktreeWorkspace` creates an isolated worktree from the repository's current commit:
+
+```text
+original repository
+        │
+        │ read-only investigation
+        ▼
+   RED baseline
+        │
+        ▼
+ isolated Git worktree
+        │
+        ▼
+   apply validated patch
+        │
+        ▼
+   same command again
+        │
+        ▼
+   GREEN verification
 ```
 
-### Investigation loop
+The worktree is independently sandboxed and is removed after the workflow completes.
 
-1. The engine emits `investigation_started` with the signal and budget.
-2. While the state is not terminal, it checks the step and time budgets, then
-   asks the planner for the next `PlannerDecision`, validated with Zod:
-   - `act`: emit `action_planned`, validate the tool input, run the tool,
-     validate its output and evidence, then emit `action_completed` or
-     `action_failed`.
-   - `update_hypotheses`: verify every cited evidence ID exists, then emit
-     `hypotheses_updated`.
-   - `propose_patch`: emit `patch_proposed`, review the proposal, then emit
-     `patch_reviewed` (`patch_rejected` or `awaiting_verification`).
-   - `finish`: emit `investigation_completed`.
-3. Terminal statuses are `completed`, `step_budget_exhausted`,
-   `time_budget_exhausted`, and `failed`.
+The original working tree must remain unchanged.
 
-Each event passes through `reduceInvestigation`, which enforces gapless
-sequence numbers and refuses events after a terminal state. Action IDs are
-unique, an action completes or fails at most once and only after it was
-planned (its record carries its status and resulting evidence IDs), and
-evidence must name the action that produced it.
+---
 
-## Getting started
+## Patch Safety
 
-Requires Node.js 22 or newer.
+`apply_patch` is available only inside an active repair worktree.
 
-```sh
+Patches are parsed and validated before being applied.
+
+The patch system rejects unsafe or malformed changes including:
+
+- malformed unified diffs
+- binary patches
+- renames and copies
+- mode changes
+- unsafe paths
+- absolute paths
+- `..` path segments
+- `.git` and `.devpilot` paths
+- symlink or submodule modes
+- patches that do not exactly match the current file contents
+- attempts to modify the failing test itself
+
+Patch application is all-or-nothing.
+
+Every patch attempt also produces evidence containing its status, reason, affected files, workspace identity, patch hash, and patch text.
+
+---
+
+## RED → PATCH → GREEN
+
+`RepairWorkflow` is a deterministic orchestrator.
+
+It does not invent, improve, or choose patches.
+
+The workflow is:
+
+1. Run the verification command against the original repository.
+2. Confirm the expected failure.
+3. Identify the specific failing tests.
+4. Create an isolated Git worktree.
+5. Confirm the same failure exists in the unpatched worktree.
+6. Apply the reviewed patch.
+7. Run the identical command again.
+8. Confirm GREEN.
+9. Confirm the previously failing tests specifically passed.
+10. Verify the original repository and its Git metadata remain unchanged.
+11. Confirm the worktree contains exactly the expected changes.
+12. Produce the repaired result and grounded evidence.
+
+A successful exit code is therefore only one part of the proof.
+
+---
+
+## Rule-First, Model-Escalation Planning
+
+DevPilot does not require a model call for every incident.
+
+The planner first attempts deterministic, evidence-driven reasoning.
+
+If the rules can explain the incident, the repair can proceed without a model call.
+
+When the deterministic planner cannot sufficiently explain the failure, the investigation can escalate to the model planner.
+
+The model is still constrained by the investigation's evidence and proposal/review/verification pipeline.
+
+This creates a useful separation:
+
+```text
+                    Investigation
+                         │
+                         ▼
+                 Evidence collection
+                         │
+                         ▼
+                  Rule-based planner
+                    /           \
+                   /             \
+              sufficient       insufficient
+                 │                   │
+                 ▼                   ▼
+              Proposal        Model escalation
+                 │                   │
+                 └─────────┬─────────┘
+                           ▼
+                     Proposal Review
+                           │
+                           ▼
+                    RED → PATCH → GREEN
+```
+
+---
+
+## Hypothesis Selection
+
+DevPilot treats hypothesis selection as an evidence problem rather than simply accepting the model's most confident answer.
+
+Evidence can support or contradict hypotheses.
+
+Evidence that explains multiple hypotheses equally well does not distinguish between them.
+
+The planner therefore avoids manufacturing contradictions merely to force a selection.
+
+When competing hypotheses remain indistinguishable, the repair is refused rather than guessing.
+
+This is especially important for model-assisted repair: uncertainty is treated as a reason to stop, not a reason to fabricate confidence.
+
+---
+
+## MCP Server and Host
+
+DevPilot exposes the investigation service through a self-hosted MCP server.
+
+The composition root keeps the transport layer separated from the investigation engine and planner.
+
+The host provides:
+
+- repository registration
+- investigation orchestration
+- planner integration
+- MCP access
+- bearer-token authentication
+- origin controls
+- loopback operation for the local demo
+- bounded model-call configuration
+
+The public-facing MCP responses intentionally avoid exposing internal model text, raw diffs, host filesystem paths, or authentication tokens.
+
+---
+
+## Grounded Reports
+
+The final report is validated against the underlying investigation evidence and event log.
+
+The system checks that report claims do not contradict the actual recorded state.
+
+This prevents a successful-looking report from becoming a second, unverified source of truth.
+
+The repair result carries proof of:
+
+- the incident
+- baseline RED evidence
+- unpatched worktree RED evidence
+- reviewed proposal
+- applied patch
+- final GREEN evidence
+- affected files
+- baseline failure identities
+- original-repository integrity
+
+---
+
+## Validation
+
+The repository contains extensive automated coverage across the investigation, planner, MCP, repair, and grounding layers.
+
+The final validation run completed with:
+
+```text
+919 tests
+150 suites
+919 passed
+0 failed
+0 cancelled
+0 skipped
+```
+
+Additional integration coverage verifies the operator-boundary repair behavior and the DevPilot host's rule-first/model-escalation path.
+
+---
+
+## Example Repair
+
+DevPilot's shipping fixture demonstrates a boundary-condition repair.
+
+The failing behavior comes from an operator boundary where:
+
+```text
+>
+```
+
+must become:
+
+```text
+>=
+```
+
+The important part is not the individual operator change.
+
+The workflow proves that:
+
+1. the failure exists before the patch,
+2. the hypothesis is supported by collected evidence,
+3. the proposal is reviewed,
+4. the patch is applied only in an isolated worktree,
+5. the same failing test passes afterward,
+6. the original repository remains unchanged.
+
+---
+
+## Project Structure
+
+```text
+apps/
+├── cli/
+├── mcp/
+├── api/
+├── web/
+└── devpilot-host/
+
+packages/
+├── core/
+├── tools/
+├── planners/
+├── engine/
+├── service/
+├── planner-bedrock/
+└── eval/
+
+fixtures/
+└── ...
+
+tests/
+└── integration and end-to-end coverage
+```
+
+---
+
+## Running the Project
+
+Install dependencies:
+
+```bash
 npm install
-npm run cli
 ```
 
-## Scripts
+Run the complete validation suite:
 
-| Command             | Description                                  |
-| ------------------- | -------------------------------------------- |
-| `npm run cli`       | Run the CLI                                  |
-| `npm run mcp`       | Run the MCP server (see [MCP server](#mcp-server)) |
-| `npm run simulator` | Run the Alexa+ style simulator (see [Alexa+ style simulator](#alexa-style-simulator)) |
-| `npm test`          | Run all tests with `node:test` via `tsx`     |
-| `npm run typecheck` | Type-check every package and test with `tsc` |
-| `npm run check`     | Typecheck, then test                         |
+```bash
+npm run check
+```
 
-Workspace packages are consumed directly from TypeScript source through their
-`exports` field; there is no build step yet.
+Run tests directly:
+
+```bash
+npm test
+```
+
+The repository also provides scripts for the CLI, MCP server, simulator, and the live Bedrock host.
+
+The live Bedrock host requires the appropriate environment configuration and explicitly requires:
+
+```text
+DEVPILOT_LIVE_BEDROCK=1
+DEVPILOT_MCP_TOKEN=<token>
+DEVPILOT_MCP_CONFIG=<config-file>
+```
+
+See `.env.example` and the source configuration for the supported environment variables.
+
+---
+
+## Safety Philosophy
+
+DevPilot is intentionally conservative.
+
+A system that modifies source code should be able to answer:
+
+> **What failed?**
+
+> **What evidence supports the diagnosis?**
+
+> **Why was this hypothesis selected?**
+
+> **What exact patch was proposed?**
+
+> **Was the failure reproduced before changing anything?**
+
+> **Did the same failure actually disappear afterward?**
+
+> **Did the original repository remain untouched?**
+
+If the system cannot establish those facts, the repair should not be presented as verified.
+
+---
+
+## Hackathon
+
+Built for the **Build, Ship, Shape: Amazon Developer Hackathon**.
+
+DevPilot focuses on a practical problem in AI-assisted software development:
+
+**How can an autonomous coding agent make changes while producing evidence that the change is actually correct?**
+
+The answer in DevPilot is not simply a better prompt.
+
+It is a controlled repair pipeline where models operate inside a deterministic, evidence-grounded verification system.
+
+---
 
 ## License
 
-MIT
+See [LICENSE](LICENSE).
